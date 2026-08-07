@@ -17,11 +17,18 @@
 
 namespace {
 
-constexpr int kBlockSize = 256;
+constexpr int kRmsNormBlockSize = 256;
+constexpr int kScalarAttentionBlockSize = 256;
 constexpr int kMaximumHeadDim = 256;
-constexpr int kWarpSize = 32;
+constexpr int kShuffleMaskWidth = 32;
 constexpr int kSubwarpSize = 16;
-constexpr int kSubwarpsPerBlock = kBlockSize / kSubwarpSize;
+#if defined(PLATFORM_ILUVATAR)
+constexpr int kSubwarpAttentionBlockSize = 1024;
+#else
+constexpr int kSubwarpAttentionBlockSize = 256;
+#endif
+constexpr int kSubwarpsPerBlock =
+    kSubwarpAttentionBlockSize / kSubwarpSize;
 
 size_t checkedElementCount(std::initializer_list<size_t> dimensions) {
   size_t count = 1;
@@ -58,7 +65,7 @@ __device__ __forceinline__ half fromFloat<half>(float value) {
 template <typename T>
 __global__ void rmsNormKernel(const T* input, const T* weight, T* output,
                               size_t hidden_dim, float eps) {
-  __shared__ float partial_sums[kBlockSize];
+  __shared__ float partial_sums[kRmsNormBlockSize];
 
   const size_t row_offset = static_cast<size_t>(blockIdx.x) * hidden_dim;
   float sum = 0.0f;
@@ -69,7 +76,7 @@ __global__ void rmsNormKernel(const T* input, const T* weight, T* output,
 
   partial_sums[threadIdx.x] = sum;
   __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+  for (unsigned int stride = blockDim.x / 2; stride > 0; stride /= 2) {
     if (threadIdx.x < stride) {
       partial_sums[threadIdx.x] += partial_sums[threadIdx.x + stride];
     }
@@ -182,24 +189,19 @@ __global__ void flashAttentionScalarKernel(const T* query, const T* key,
     if (is_causal && source_position > target_position) {
       continue;
     }
-    const size_t key_offset =
+    const size_t kv_offset =
         ((static_cast<size_t>(batch) * src_seq_len + source_position) *
              kv_heads +
          kv_head) *
         head_dim;
     const float probability =
         expf(scalarAttentionScore<T, static_head_dim>(
-                 query_cache, key, key_offset, head_dim, scale) -
+                 query_cache, key, kv_offset, head_dim, scale) -
              maximum_score) *
         inverse_denominator;
-    const size_t value_offset =
-        ((static_cast<size_t>(batch) * src_seq_len + source_position) *
-             kv_heads +
-         kv_head) *
-        head_dim;
     for (int dimension = 0; dimension < head_dim; ++dimension) {
       output_accumulator[dimension] +=
-          probability * toFloat(value[value_offset + dimension]);
+          probability * toFloat(value[kv_offset + dimension]);
     }
   }
 
@@ -209,21 +211,41 @@ __global__ void flashAttentionScalarKernel(const T* query, const T* key,
   }
 }
 
+#if defined(PLATFORM_NVIDIA) || defined(PLATFORM_ILUVATAR)
 template <typename T, int static_head_dim>
 __device__ __forceinline__ float subwarpAttentionScore(
     const float* query_values, const T* key, size_t key_offset, float scale,
-    int lane_in_subwarp, int subwarp_start, unsigned int subwarp_mask) {
+    int lane_in_subwarp, unsigned int subwarp_mask) {
   constexpr int values_per_lane = static_head_dim / kSubwarpSize;
   float partial_score = 0.0f;
+#if defined(PLATFORM_ILUVATAR)
+  if constexpr (std::is_same_v<T, float>) {
+    // Match the reference QK accumulation order for its strict float tolerance.
+#pragma unroll
+    for (int slot = 0; slot < values_per_lane; ++slot) {
+#pragma unroll
+      for (int source_lane = 0; source_lane < kSubwarpSize; ++source_lane) {
+        const float query_value = __shfl_sync(
+            subwarp_mask, query_values[slot], source_lane, kSubwarpSize);
+        if (lane_in_subwarp == 0) {
+          const int dimension = source_lane + slot * kSubwarpSize;
+          partial_score += query_value * key[key_offset + dimension];
+        }
+      }
+    }
+    return __shfl_sync(subwarp_mask, partial_score, 0, kSubwarpSize) * scale;
+  }
+#endif
 #pragma unroll
   for (int slot = 0; slot < values_per_lane; ++slot) {
     const int dimension = lane_in_subwarp + slot * kSubwarpSize;
     partial_score += query_values[slot] * toFloat(key[key_offset + dimension]);
   }
   for (int offset = kSubwarpSize / 2; offset > 0; offset /= 2) {
-    partial_score += __shfl_down_sync(subwarp_mask, partial_score, offset);
+    partial_score += __shfl_down_sync(subwarp_mask, partial_score, offset,
+                                      kSubwarpSize);
   }
-  return __shfl_sync(subwarp_mask, partial_score, subwarp_start) * scale;
+  return __shfl_sync(subwarp_mask, partial_score, 0, kSubwarpSize) * scale;
 }
 
 template <typename T, int static_head_dim>
@@ -231,15 +253,14 @@ __global__ void flashAttentionSubwarpKernel(const T* query, const T* key,
                                             const T* value, T* output,
                                             int batch_size, int target_seq_len,
                                             int src_seq_len, int query_heads,
-                                            int kv_heads, int head_dim,
-                                            bool is_causal) {
+                                            int kv_heads, bool is_causal) {
   static_assert(static_head_dim % kSubwarpSize == 0 &&
                 static_head_dim <= kMaximumHeadDim);
-  const int lane_in_warp = threadIdx.x % kWarpSize;
-  const int lane_in_subwarp = lane_in_warp % kSubwarpSize;
-  const int subwarp_start = lane_in_warp - lane_in_subwarp;
+  // CoreX repeats its 32-bit shuffle mask across each half of a 64-lane warp.
+  const int lane_in_half_warp = threadIdx.x % kShuffleMaskWidth;
+  const int lane_in_subwarp = lane_in_half_warp % kSubwarpSize;
   const unsigned int subwarp_mask =
-      subwarp_start == 0 ? 0x0000ffffu : 0xffff0000u;
+      lane_in_half_warp < kSubwarpSize ? 0x0000ffffu : 0xffff0000u;
   const int subwarp_index_in_block = threadIdx.x / kSubwarpSize;
   const size_t query_index =
       static_cast<size_t>(blockIdx.x) * kSubwarpsPerBlock +
@@ -262,7 +283,7 @@ __global__ void flashAttentionSubwarpKernel(const T* query, const T* key,
       ((static_cast<size_t>(batch) * target_seq_len + target_position) *
            query_heads +
        query_head) *
-      head_dim;
+      static_head_dim;
 
   constexpr int values_per_lane = static_head_dim / kSubwarpSize;
   float query_values[values_per_lane];
@@ -274,7 +295,7 @@ __global__ void flashAttentionSubwarpKernel(const T* query, const T* key,
     output_accumulator[slot] = 0.0f;
   }
 
-  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+  const float scale = 1.0f / sqrtf(static_cast<float>(static_head_dim));
   float maximum_score = -FLT_MAX;
   float softmax_denominator = 0.0f;
   for (int source_position = 0; source_position < src_seq_len;
@@ -282,14 +303,13 @@ __global__ void flashAttentionSubwarpKernel(const T* query, const T* key,
     if (is_causal && source_position > target_position) {
       continue;
     }
-    const size_t key_offset =
+    const size_t kv_offset =
         ((static_cast<size_t>(batch) * src_seq_len + source_position) *
              kv_heads +
          kv_head) *
-        head_dim;
+        static_head_dim;
     const float score = subwarpAttentionScore<T, static_head_dim>(
-        query_values, key, key_offset, scale, lane_in_subwarp, subwarp_start,
-        subwarp_mask);
+        query_values, key, kv_offset, scale, lane_in_subwarp, subwarp_mask);
     float previous_scale = 0.0f;
     float score_scale = 0.0f;
     if (lane_in_subwarp == 0) {
@@ -299,20 +319,16 @@ __global__ void flashAttentionSubwarpKernel(const T* query, const T* key,
       softmax_denominator = softmax_denominator * previous_scale + score_scale;
       maximum_score = next_maximum_score;
     }
-    previous_scale = __shfl_sync(subwarp_mask, previous_scale, subwarp_start);
-    score_scale = __shfl_sync(subwarp_mask, score_scale, subwarp_start);
+    previous_scale =
+        __shfl_sync(subwarp_mask, previous_scale, 0, kSubwarpSize);
+    score_scale = __shfl_sync(subwarp_mask, score_scale, 0, kSubwarpSize);
 
-    const size_t value_offset =
-        ((static_cast<size_t>(batch) * src_seq_len + source_position) *
-             kv_heads +
-         kv_head) *
-        head_dim;
 #pragma unroll
     for (int slot = 0; slot < values_per_lane; ++slot) {
       const int dimension = lane_in_subwarp + slot * kSubwarpSize;
       output_accumulator[slot] =
           output_accumulator[slot] * previous_scale +
-          score_scale * toFloat(value[value_offset + dimension]);
+          score_scale * toFloat(value[kv_offset + dimension]);
     }
   }
 
@@ -322,7 +338,7 @@ __global__ void flashAttentionSubwarpKernel(const T* query, const T* key,
         softmax_denominator == 0.0f ? 0.0f : 1.0f / softmax_denominator;
   }
   inverse_denominator =
-      __shfl_sync(subwarp_mask, inverse_denominator, subwarp_start);
+      __shfl_sync(subwarp_mask, inverse_denominator, 0, kSubwarpSize);
 #pragma unroll
   for (int slot = 0; slot < values_per_lane; ++slot) {
     const int dimension = lane_in_subwarp + slot * kSubwarpSize;
@@ -330,6 +346,7 @@ __global__ void flashAttentionSubwarpKernel(const T* query, const T* key,
         fromFloat<T>(output_accumulator[slot] * inverse_denominator);
   }
 }
+#endif
 
 }  // namespace
 
@@ -383,17 +400,20 @@ void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
   T* d_input = nullptr;
   T* d_weight = nullptr;
   T* d_output = nullptr;
-  RUNTIME_CHECK(cudaMalloc(&d_input, input_bytes));
-  RUNTIME_CHECK(cudaMalloc(&d_weight, weight_bytes));
-  RUNTIME_CHECK(cudaMalloc(&d_output, input_bytes));
+  RUNTIME_CHECK(
+      cudaMalloc(reinterpret_cast<void**>(&d_input), input_bytes));
+  RUNTIME_CHECK(
+      cudaMalloc(reinterpret_cast<void**>(&d_weight), weight_bytes));
+  RUNTIME_CHECK(
+      cudaMalloc(reinterpret_cast<void**>(&d_output), input_bytes));
 
   RUNTIME_CHECK(
       cudaMemcpy(d_input, h_input.data(), input_bytes, cudaMemcpyHostToDevice));
   RUNTIME_CHECK(cudaMemcpy(d_weight, h_weight.data(), weight_bytes,
                            cudaMemcpyHostToDevice));
 
-  rmsNormKernel<<<rows, kBlockSize>>>(d_input, d_weight, d_output, hidden_dim,
-                                      eps);
+  rmsNormKernel<<<rows, kRmsNormBlockSize>>>(d_input, d_weight, d_output,
+                                            hidden_dim, eps);
   RUNTIME_CHECK(cudaGetLastError());
   RUNTIME_CHECK(cudaMemcpy(h_output.data(), d_output, input_bytes,
                            cudaMemcpyDeviceToHost));
@@ -458,11 +478,20 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     h_o.clear();
     return;
   }
-  constexpr bool is_half = std::is_same_v<T, half>;
+#if defined(PLATFORM_NVIDIA) || defined(PLATFORM_ILUVATAR)
+#if defined(PLATFORM_ILUVATAR)
+  constexpr bool supports_subwarp_type = true;
+#else
+  constexpr bool supports_subwarp_type = std::is_same_v<T, half>;
+#endif
   const bool uses_subwarp =
-      is_half && head_dim >= kSubwarpSize && (head_dim & (head_dim - 1)) == 0;
+      supports_subwarp_type && head_dim >= kSubwarpSize &&
+      (head_dim & (head_dim - 1)) == 0;
   const size_t queries_per_block =
-      uses_subwarp ? kSubwarpsPerBlock : kBlockSize;
+      uses_subwarp ? kSubwarpsPerBlock : kScalarAttentionBlockSize;
+#else
+  const size_t queries_per_block = kScalarAttentionBlockSize;
+#endif
   const size_t block_count =
       (query_count + queries_per_block - 1) / queries_per_block;
   if (block_count > std::numeric_limits<unsigned int>::max()) {
@@ -478,10 +507,12 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   T* d_key = nullptr;
   T* d_value = nullptr;
   T* d_output = nullptr;
-  RUNTIME_CHECK(cudaMalloc(&d_query, query_bytes));
-  RUNTIME_CHECK(cudaMalloc(&d_key, kv_bytes));
-  RUNTIME_CHECK(cudaMalloc(&d_value, kv_bytes));
-  RUNTIME_CHECK(cudaMalloc(&d_output, query_bytes));
+  RUNTIME_CHECK(
+      cudaMalloc(reinterpret_cast<void**>(&d_query), query_bytes));
+  RUNTIME_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_key), kv_bytes));
+  RUNTIME_CHECK(cudaMalloc(reinterpret_cast<void**>(&d_value), kv_bytes));
+  RUNTIME_CHECK(
+      cudaMalloc(reinterpret_cast<void**>(&d_output), query_bytes));
 
   RUNTIME_CHECK(
       cudaMemcpy(d_query, h_q.data(), query_bytes, cudaMemcpyHostToDevice));
@@ -490,51 +521,61 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   RUNTIME_CHECK(
       cudaMemcpy(d_value, h_v.data(), kv_bytes, cudaMemcpyHostToDevice));
 
-  if constexpr (is_half) {
+#if defined(PLATFORM_NVIDIA) || defined(PLATFORM_ILUVATAR)
+  if (uses_subwarp) {
     switch (head_dim) {
       case 16:
-        flashAttentionSubwarpKernel<T, 16><<<grid_blocks, kBlockSize>>>(
+        flashAttentionSubwarpKernel<T, 16>
+            <<<grid_blocks, kSubwarpAttentionBlockSize>>>(
             d_query, d_key, d_value, d_output, batch_size, target_seq_len,
-            src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+            src_seq_len, query_heads, kv_heads, is_causal);
         break;
       case 32:
-        flashAttentionSubwarpKernel<T, 32><<<grid_blocks, kBlockSize>>>(
+        flashAttentionSubwarpKernel<T, 32>
+            <<<grid_blocks, kSubwarpAttentionBlockSize>>>(
             d_query, d_key, d_value, d_output, batch_size, target_seq_len,
-            src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+            src_seq_len, query_heads, kv_heads, is_causal);
         break;
       case 64:
-        flashAttentionSubwarpKernel<T, 64><<<grid_blocks, kBlockSize>>>(
+        flashAttentionSubwarpKernel<T, 64>
+            <<<grid_blocks, kSubwarpAttentionBlockSize>>>(
             d_query, d_key, d_value, d_output, batch_size, target_seq_len,
-            src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+            src_seq_len, query_heads, kv_heads, is_causal);
         break;
       case 128:
-        flashAttentionSubwarpKernel<T, 128><<<grid_blocks, kBlockSize>>>(
+        flashAttentionSubwarpKernel<T, 128>
+            <<<grid_blocks, kSubwarpAttentionBlockSize>>>(
             d_query, d_key, d_value, d_output, batch_size, target_seq_len,
-            src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+            src_seq_len, query_heads, kv_heads, is_causal);
         break;
       case 256:
-        flashAttentionSubwarpKernel<T, 256><<<grid_blocks, kBlockSize>>>(
+        flashAttentionSubwarpKernel<T, 256>
+            <<<grid_blocks, kSubwarpAttentionBlockSize>>>(
             d_query, d_key, d_value, d_output, batch_size, target_seq_len,
-            src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+            src_seq_len, query_heads, kv_heads, is_causal);
         break;
-      default:
-        flashAttentionScalarKernel<T><<<grid_blocks, kBlockSize>>>(
-            d_query, d_key, d_value, d_output, batch_size, target_seq_len,
-            src_seq_len, query_heads, kv_heads, head_dim, is_causal);
     }
-  } else if (head_dim == 32) {
-    flashAttentionScalarKernel<T, 32><<<grid_blocks, kBlockSize>>>(
-        d_query, d_key, d_value, d_output, batch_size, target_seq_len,
-        src_seq_len, query_heads, kv_heads, head_dim, is_causal);
-  } else if (head_dim == 64) {
-    flashAttentionScalarKernel<T, 64><<<grid_blocks, kBlockSize>>>(
-        d_query, d_key, d_value, d_output, batch_size, target_seq_len,
-        src_seq_len, query_heads, kv_heads, head_dim, is_causal);
   } else {
-    flashAttentionScalarKernel<T><<<grid_blocks, kBlockSize>>>(
-        d_query, d_key, d_value, d_output, batch_size, target_seq_len,
-        src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+#endif
+    if (head_dim == 32) {
+      flashAttentionScalarKernel<T, 32>
+          <<<grid_blocks, kScalarAttentionBlockSize>>>(
+          d_query, d_key, d_value, d_output, batch_size, target_seq_len,
+          src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+    } else if (head_dim == 64) {
+      flashAttentionScalarKernel<T, 64>
+          <<<grid_blocks, kScalarAttentionBlockSize>>>(
+          d_query, d_key, d_value, d_output, batch_size, target_seq_len,
+          src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+    } else {
+      flashAttentionScalarKernel<T>
+          <<<grid_blocks, kScalarAttentionBlockSize>>>(
+          d_query, d_key, d_value, d_output, batch_size, target_seq_len,
+          src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+    }
+#if defined(PLATFORM_NVIDIA) || defined(PLATFORM_ILUVATAR)
   }
+#endif
   RUNTIME_CHECK(cudaGetLastError());
   RUNTIME_CHECK(
       cudaMemcpy(h_o.data(), d_output, query_bytes, cudaMemcpyDeviceToHost));

@@ -16,6 +16,7 @@ PLATFORM_DEFINE ?= -DPLATFORM_NVIDIA
 STUDENT_SUFFIX  := cu
 CFLAGS          := -std=c++17 -O0
 EXTRA_LIBS     	:= 
+SOURCE_CFLAGS   :=
 
 # Compiler & Tester object selection based on PLATFORM
 ifeq ($(PLATFORM),nvidia)
@@ -25,6 +26,7 @@ ifeq ($(PLATFORM),nvidia)
 else ifeq ($(PLATFORM),iluvatar)
     CC          	:= clang++
 	CFLAGS          := -std=c++17 -O3
+	SOURCE_CFLAGS   := -x ivcore
     TEST_OBJ    	:= tester/tester_iluvatar.o
 	PLATFORM_DEFINE := -DPLATFORM_ILUVATAR
 	EXTRA_LIBS		:= -lcudart -I/usr/local/corex/include -L/usr/local/corex/lib64 -fPIC
@@ -45,11 +47,14 @@ else
 endif
 
 # Executable name
-TARGET          	:= test_kernels
+SUPPORTED_PLATFORMS := nvidia iluvatar moore metax
+TARGET          	:= test_kernels_$(PLATFORM)
 # Kernel implementation
 STUDENT_SRC     	:= src/kernels.$(STUDENT_SUFFIX) 
 # Compiled student object (auto-generated)
-STUDENT_OBJ  		:= $(addsuffix .o,$(basename $(STUDENT_SRC)))
+STUDENT_OBJ  		:= $(addsuffix .$(PLATFORM).o,$(basename $(STUDENT_SRC)))
+ALL_TARGETS       := $(addprefix test_kernels_,$(SUPPORTED_PLATFORMS))
+ALL_STUDENT_OBJS  := $(foreach platform,$(SUPPORTED_PLATFORMS),src/kernels.$(platform).o)
 # Tester's actual verbose argument (e.g., --verbose, -v)
 TEST_VERBOSE_FLAG 	:= --verbose
 # User-provided verbose mode (true/false; default: false)
@@ -87,7 +92,7 @@ run: $(TARGET)
 # Clean target: Delete temporary files (executable + src object)
 clean:
 	@echo "=== Cleaning temporary files ==="
-	rm -f $(TARGET) $(STUDENT_OBJ)
+	rm -f $(ALL_TARGETS) $(ALL_STUDENT_OBJS) test_kernels src/kernels.o
 
 # -------------------------------
 # Dependency Rules (Core Logic)
@@ -100,4 +105,4 @@ $(TARGET): $(STUDENT_OBJ) $(TEST_OBJ)
 # Generate src object: Compile kernels.cu (triggers template instantiation)
 $(STUDENT_OBJ): $(STUDENT_SRC)
 	@echo "=== Compiling student code ($(STUDENT_SRC)) ==="
-	$(CC) $(CFLAGS) $(PLATFORM_DEFINE) -c $< -o $@
+	$(CC) $(CFLAGS) $(SOURCE_CFLAGS) $(PLATFORM_DEFINE) -c $< -o $@

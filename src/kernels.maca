@@ -1,68 +1,596 @@
-#include <vector>
+// 作者：HGinkgo
+
 #include <common/maca_fp16.h>
+
+#include <cfloat>
+#include <initializer_list>
+#include <limits>
+#include <stdexcept>
+#include <type_traits>
+#include <vector>
 
 #include "../tester/utils.h"
 
+namespace {
+
+constexpr int kRmsNormBlockSize = 256;
+constexpr int kScalarAttentionBlockSize = 256;
+constexpr int kMaximumHeadDim = 256;
+
+size_t checkedElementCount(std::initializer_list<size_t> dimensions) {
+    size_t count = 1;
+    for (const size_t dimension : dimensions) {
+        if (dimension != 0 &&
+            count > std::numeric_limits<size_t>::max() / dimension) {
+            throw std::overflow_error("tensor element count overflow");
+        }
+        count *= dimension;
+    }
+    return count;
+}
+
+template <typename T>
+__device__ __forceinline__ float toFloat(T value) {
+    return static_cast<float>(value);
+}
+
+template <>
+__device__ __forceinline__ float toFloat<half>(half value) {
+    return __half2float(value);
+}
+
+template <typename T>
+__device__ __forceinline__ T fromFloat(float value) {
+    return static_cast<T>(value);
+}
+
+template <>
+__device__ __forceinline__ half fromFloat<half>(float value) {
+    return __float2half(value);
+}
+
+template <typename T>
+__global__ void rmsNormKernel(const T* input, const T* weight, T* output,
+                              size_t hidden_dim, float eps) {
+    __shared__ float partial_sums[kRmsNormBlockSize];
+
+    const size_t row_offset = static_cast<size_t>(blockIdx.x) * hidden_dim;
+    float sum = 0.0f;
+    for (size_t column = threadIdx.x; column < hidden_dim;
+         column += blockDim.x) {
+        const float value = toFloat(input[row_offset + column]);
+        sum += value * value;
+    }
+
+    partial_sums[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        if (threadIdx.x < stride) {
+            partial_sums[threadIdx.x] += partial_sums[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+
+    const float inverse_rms =
+        rsqrtf(partial_sums[0] / static_cast<float>(hidden_dim) + eps);
+    for (size_t column = threadIdx.x; column < hidden_dim;
+         column += blockDim.x) {
+        const float normalized = toFloat(input[row_offset + column]) *
+                                 inverse_rms * toFloat(weight[column]);
+        output[row_offset + column] = fromFloat<T>(normalized);
+    }
+}
+
+template <typename T>
+__device__ __forceinline__ float scalarAttentionScore(
+    const float* query, const T* key, size_t key_offset, int head_dim,
+    float scale) {
+    float score = 0.0f;
+    for (int dimension = 0; dimension < head_dim; ++dimension) {
+        score += query[dimension] * toFloat(key[key_offset + dimension]);
+    }
+    return score * scale;
+}
+
+template <typename T>
+__global__ void scalarAttentionKernel(
+    const T* query, const T* key, const T* value, T* output, int batch_size,
+    int target_seq_len, int src_seq_len, int query_heads, int kv_heads,
+    int head_dim, bool is_causal) {
+    const size_t query_index =
+        static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t query_count =
+        static_cast<size_t>(batch_size) * target_seq_len * query_heads;
+    if (query_index >= query_count) {
+        return;
+    }
+
+    size_t remaining = query_index;
+    const int query_head = static_cast<int>(remaining % query_heads);
+    remaining /= query_heads;
+    const int target_position = static_cast<int>(remaining % target_seq_len);
+    const int batch = static_cast<int>(remaining / target_seq_len);
+    const int kv_head = query_head / (query_heads / kv_heads);
+    const size_t query_offset =
+        ((static_cast<size_t>(batch) * target_seq_len + target_position) *
+             query_heads +
+         query_head) *
+        head_dim;
+
+    float query_cache[kMaximumHeadDim];
+    float output_accumulator[kMaximumHeadDim];
+    for (int dimension = 0; dimension < head_dim; ++dimension) {
+        query_cache[dimension] = toFloat(query[query_offset + dimension]);
+        output_accumulator[dimension] = 0.0f;
+    }
+
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    float maximum_score = -FLT_MAX;
+    for (int source_position = 0; source_position < src_seq_len;
+         ++source_position) {
+        if (is_causal && source_position > target_position) {
+            continue;
+        }
+        const size_t key_offset =
+            ((static_cast<size_t>(batch) * src_seq_len + source_position) *
+                 kv_heads +
+             kv_head) *
+            head_dim;
+        maximum_score =
+            fmaxf(maximum_score,
+                  scalarAttentionScore(query_cache, key, key_offset, head_dim,
+                                       scale));
+    }
+
+    float denominator = 0.0f;
+    for (int source_position = 0; source_position < src_seq_len;
+         ++source_position) {
+        if (is_causal && source_position > target_position) {
+            continue;
+        }
+        const size_t key_offset =
+            ((static_cast<size_t>(batch) * src_seq_len + source_position) *
+                 kv_heads +
+             kv_head) *
+            head_dim;
+        denominator +=
+            expf(scalarAttentionScore(query_cache, key, key_offset, head_dim,
+                                      scale) -
+                 maximum_score);
+    }
+    const float inverse_denominator =
+        denominator == 0.0f ? 0.0f : 1.0f / denominator;
+
+    for (int source_position = 0; source_position < src_seq_len;
+         ++source_position) {
+        if (is_causal && source_position > target_position) {
+            continue;
+        }
+        const size_t kv_offset =
+            ((static_cast<size_t>(batch) * src_seq_len + source_position) *
+                 kv_heads +
+             kv_head) *
+            head_dim;
+        const float probability =
+            expf(scalarAttentionScore(query_cache, key, kv_offset, head_dim,
+                                      scale) -
+                 maximum_score) *
+            inverse_denominator;
+        for (int dimension = 0; dimension < head_dim; ++dimension) {
+            output_accumulator[dimension] +=
+                probability * toFloat(value[kv_offset + dimension]);
+        }
+    }
+
+    for (int dimension = 0; dimension < head_dim; ++dimension) {
+        output[query_offset + dimension] =
+            fromFloat<T>(output_accumulator[dimension]);
+    }
+}
+
+template <typename T, int head_dim, int subwave_size>
+__device__ __forceinline__ float subwaveAttentionScore(
+    const float* query_values, const T* key, size_t key_offset, float scale,
+    int lane, unsigned long mask) {
+    constexpr int values_per_lane = head_dim / subwave_size;
+    float score = 0.0f;
+
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int slot = 0; slot < values_per_lane; ++slot) {
+#pragma unroll
+            for (int query_lane = 0; query_lane < subwave_size;
+                 ++query_lane) {
+                const int dimension = slot * subwave_size + query_lane;
+                const float query_value = __shfl_sync(
+                    mask, query_values[slot], query_lane, subwave_size);
+                if constexpr (head_dim >= 64) {
+                    score += query_value * key[key_offset + dimension];
+                } else if (lane == 0) {
+                    score += query_value * key[key_offset + dimension];
+                }
+            }
+        }
+        if constexpr (head_dim >= 64) {
+            return score * scale;
+        }
+        return __shfl_sync(mask, score, 0, subwave_size) * scale;
+    } else if constexpr (std::is_same_v<T, half>) {
+        constexpr int pairs_per_lane = values_per_lane / 2;
+        const __half2* packed_key =
+            reinterpret_cast<const __half2*>(key + key_offset);
+#pragma unroll
+        for (int pair = 0; pair < pairs_per_lane; ++pair) {
+            const float2 key_values =
+                __half22float2(packed_key[lane * pairs_per_lane + pair]);
+            score += query_values[pair * 2] * key_values.x;
+            score += query_values[pair * 2 + 1] * key_values.y;
+        }
+    }
+#pragma unroll
+    for (int offset = subwave_size / 2; offset > 0; offset /= 2) {
+        score += __shfl_down_sync(mask, score, offset, subwave_size);
+    }
+    return __shfl_sync(mask, score, 0, subwave_size) * scale;
+}
+
+template <typename T, int head_dim, int subwave_size>
+__global__ void subwaveAttentionKernel(
+    const T* query, const T* key, const T* value, T* output, int batch_size,
+    int target_seq_len, int src_seq_len, int query_heads, int kv_heads,
+    bool is_causal) {
+    static_assert(head_dim % subwave_size == 0 &&
+                      head_dim <= kMaximumHeadDim,
+                  "unsupported head dimension");
+
+    const int lane_in_wave = threadIdx.x % 64;
+    const int lane = lane_in_wave % subwave_size;
+    const unsigned long mask =
+        ((1UL << subwave_size) - 1)
+        << ((lane_in_wave / subwave_size) * subwave_size);
+    const int subwave_index = threadIdx.x / subwave_size;
+    const size_t query_index =
+        static_cast<size_t>(blockIdx.x) * (blockDim.x / subwave_size) +
+        subwave_index;
+    const size_t query_count =
+        static_cast<size_t>(batch_size) * target_seq_len * query_heads;
+    if (query_index >= query_count) {
+        return;
+    }
+
+    size_t remaining = query_index;
+    const int query_head = static_cast<int>(remaining % query_heads);
+    remaining /= query_heads;
+    const int target_position = static_cast<int>(remaining % target_seq_len);
+    const int batch = static_cast<int>(remaining / target_seq_len);
+    const int kv_head = query_head / (query_heads / kv_heads);
+    const size_t query_offset =
+        ((static_cast<size_t>(batch) * target_seq_len + target_position) *
+             query_heads +
+         query_head) *
+        head_dim;
+
+    constexpr int values_per_lane = head_dim / subwave_size;
+    float query_values[values_per_lane];
+    float output_accumulator[values_per_lane];
+    if constexpr (std::is_same_v<T, half>) {
+        constexpr int pairs_per_lane = values_per_lane / 2;
+        const __half2* packed_query =
+            reinterpret_cast<const __half2*>(query + query_offset);
+#pragma unroll
+        for (int pair = 0; pair < pairs_per_lane; ++pair) {
+            const float2 values =
+                __half22float2(packed_query[lane * pairs_per_lane + pair]);
+            query_values[pair * 2] = values.x;
+            query_values[pair * 2 + 1] = values.y;
+            output_accumulator[pair * 2] = 0.0f;
+            output_accumulator[pair * 2 + 1] = 0.0f;
+        }
+    } else {
+#pragma unroll
+        for (int slot = 0; slot < values_per_lane; ++slot) {
+            const int dimension = lane + slot * subwave_size;
+            query_values[slot] = toFloat(query[query_offset + dimension]);
+            output_accumulator[slot] = 0.0f;
+        }
+    }
+
+    const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+    float maximum_score = -FLT_MAX;
+    float denominator = 0.0f;
+    const int source_count =
+        is_causal && target_position < src_seq_len ? target_position + 1
+                                                   : src_seq_len;
+    constexpr bool parallel_float_sources =
+        std::is_same_v<T, float> && head_dim >= 64;
+    constexpr int sources_per_iteration =
+        parallel_float_sources ? subwave_size : 1;
+    for (int source_base = 0; source_base < source_count;
+         source_base += sources_per_iteration) {
+        int local_source = source_base;
+        if constexpr (parallel_float_sources) {
+            local_source = source_base + lane;
+            if (local_source >= source_count) {
+                local_source = source_count - 1;
+            }
+        }
+        const size_t local_key_offset =
+            ((static_cast<size_t>(batch) * src_seq_len + local_source) *
+                 kv_heads +
+             kv_head) *
+            head_dim;
+        const float local_score =
+            subwaveAttentionScore<T, head_dim, subwave_size>(
+                query_values, key, local_key_offset, scale, lane, mask);
+
+        const int tile_size =
+            source_count - source_base < sources_per_iteration
+                ? source_count - source_base
+                : sources_per_iteration;
+        for (int source_slot = 0; source_slot < tile_size; ++source_slot) {
+            const int source_position = source_base + source_slot;
+            float score = local_score;
+            if constexpr (parallel_float_sources) {
+                score = __shfl_sync(mask, local_score, source_slot,
+                                    subwave_size);
+            }
+            const size_t value_offset =
+                ((static_cast<size_t>(batch) * src_seq_len +
+                  source_position) *
+                     kv_heads +
+                 kv_head) *
+                head_dim;
+
+            float previous_scale = 0.0f;
+            float score_scale = 0.0f;
+            if (lane == 0) {
+                const float next_maximum = fmaxf(maximum_score, score);
+                previous_scale = expf(maximum_score - next_maximum);
+                score_scale = expf(score - next_maximum);
+                denominator = denominator * previous_scale + score_scale;
+                maximum_score = next_maximum;
+            }
+            previous_scale =
+                __shfl_sync(mask, previous_scale, 0, subwave_size);
+            score_scale =
+                __shfl_sync(mask, score_scale, 0, subwave_size);
+
+            if constexpr (std::is_same_v<T, half>) {
+                constexpr int pairs_per_lane = values_per_lane / 2;
+                const __half2* packed_value =
+                    reinterpret_cast<const __half2*>(value + value_offset);
+#pragma unroll
+                for (int pair = 0; pair < pairs_per_lane; ++pair) {
+                    const float2 values = __half22float2(
+                        packed_value[lane * pairs_per_lane + pair]);
+                    output_accumulator[pair * 2] =
+                        output_accumulator[pair * 2] * previous_scale +
+                        score_scale * values.x;
+                    output_accumulator[pair * 2 + 1] =
+                        output_accumulator[pair * 2 + 1] * previous_scale +
+                        score_scale * values.y;
+                }
+            } else {
+#pragma unroll
+                for (int slot = 0; slot < values_per_lane; ++slot) {
+                    const int dimension = lane + slot * subwave_size;
+                    output_accumulator[slot] =
+                        output_accumulator[slot] * previous_scale +
+                        score_scale *
+                            toFloat(value[value_offset + dimension]);
+                }
+            }
+        }
+    }
+
+    float inverse_denominator = 0.0f;
+    if (lane == 0) {
+        inverse_denominator = denominator == 0.0f ? 0.0f : 1.0f / denominator;
+    }
+    inverse_denominator =
+        __shfl_sync(mask, inverse_denominator, 0, subwave_size);
+    if constexpr (std::is_same_v<T, half>) {
+        constexpr int pairs_per_lane = values_per_lane / 2;
+        __half2* packed_output =
+            reinterpret_cast<__half2*>(output + query_offset);
+#pragma unroll
+        for (int pair = 0; pair < pairs_per_lane; ++pair) {
+            packed_output[lane * pairs_per_lane + pair] =
+                __floats2half2_rn(
+                    output_accumulator[pair * 2] * inverse_denominator,
+                    output_accumulator[pair * 2 + 1] * inverse_denominator);
+        }
+    } else {
+#pragma unroll
+        for (int slot = 0; slot < values_per_lane; ++slot) {
+            const int dimension = lane + slot * subwave_size;
+            output[query_offset + dimension] =
+                fromFloat<T>(output_accumulator[slot] * inverse_denominator);
+        }
+    }
+}
+
+}  // namespace
+
 /**
  * @brief Computes RMSNorm over the last dimension of a 2D tensor.
- *
- * The input is a row-major matrix with shape [rows, hidden_dim]. For each row
- * i and column j:
- *
- *   output[i, j] = input[i, j] * rsqrt(mean(input[i, :]^2) + eps) * weight[j]
- *
- * The output vector is preallocated with rows * hidden_dim elements.
- *
- * @tparam T Data type of input, weight, and output tensors.
- * @param[in] h_input Flattened input matrix of shape [rows, hidden_dim].
- * @param[in] h_weight Per-column scale vector of shape [hidden_dim].
- * @param[out] h_output Flattened output matrix of shape [rows, hidden_dim].
- * @param[in] rows Number of rows/tokens.
- * @param[in] hidden_dim Size of the normalized dimension.
- * @param[in] eps Numerical stability epsilon.
  */
 template <typename T>
 void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
-              std::vector<T>& h_output, size_t rows, size_t hidden_dim,
-              float eps) {
-  // TODO: Implement the rmsNorm function
+             std::vector<T>& h_output, size_t rows, size_t hidden_dim,
+             float eps) {
+    if (hidden_dim == 0) {
+        throw std::invalid_argument("hidden_dim must be positive");
+    }
+    const size_t element_count = checkedElementCount({rows, hidden_dim});
+    if (h_input.size() != element_count || h_weight.size() != hidden_dim) {
+        throw std::invalid_argument("RMSNorm input size mismatch");
+    }
+    if (rows == 0) {
+        h_output.clear();
+        return;
+    }
+    if (rows > std::numeric_limits<unsigned int>::max()) {
+        throw std::overflow_error("RMSNorm grid is too large");
+    }
+
+    const size_t input_bytes = checkedElementCount({element_count, sizeof(T)});
+    const size_t weight_bytes = checkedElementCount({hidden_dim, sizeof(T)});
+    h_output.resize(element_count);
+
+    T* d_input = nullptr;
+    T* d_weight = nullptr;
+    T* d_output = nullptr;
+    RUNTIME_CHECK(mcMalloc(reinterpret_cast<void**>(&d_input), input_bytes));
+    RUNTIME_CHECK(mcMalloc(reinterpret_cast<void**>(&d_weight), weight_bytes));
+    RUNTIME_CHECK(mcMalloc(reinterpret_cast<void**>(&d_output), input_bytes));
+    RUNTIME_CHECK(
+        mcMemcpy(d_input, h_input.data(), input_bytes, mcMemcpyHostToDevice));
+    RUNTIME_CHECK(mcMemcpy(d_weight, h_weight.data(), weight_bytes,
+                           mcMemcpyHostToDevice));
+
+    rmsNormKernel<<<static_cast<unsigned int>(rows), kRmsNormBlockSize>>>(
+        d_input, d_weight, d_output, hidden_dim, eps);
+    RUNTIME_CHECK(mcGetLastError());
+    RUNTIME_CHECK(mcMemcpy(h_output.data(), d_output, input_bytes,
+                           mcMemcpyDeviceToHost));
+
+    RUNTIME_CHECK(mcFree(d_output));
+    RUNTIME_CHECK(mcFree(d_weight));
+    RUNTIME_CHECK(mcFree(d_input));
 }
 
 /**
- * @brief Computes flash attention for given query, key, and value tensors.
- * 
- * @tparam T Data type (float) for input/output tensors
- * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[in] h_v Value tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] batch_size Batch dimension size
- * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length  
- * @param[in] query_heads Number of query attention heads
- * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
- * @param[in] head_dim Dimension size of each attention head
- * @param[in] is_causal Whether to apply causal masking
+ * @brief Computes scaled dot-product attention with causal masking and GQA.
  */
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
-  // TODO: Implement the flash attention function
+                    int batch_size, int target_seq_len, int src_seq_len,
+                    int query_heads, int kv_heads, int head_dim,
+                    bool is_causal) {
+    if (batch_size < 0 || target_seq_len < 0 || src_seq_len <= 0) {
+        throw std::invalid_argument(
+            "attention dimensions must be non-negative and source non-empty");
+    }
+    if (query_heads <= 0 || kv_heads <= 0 || query_heads % kv_heads != 0) {
+        throw std::invalid_argument(
+            "query_heads must be divisible by positive kv_heads");
+    }
+    if (head_dim <= 0 || head_dim > kMaximumHeadDim) {
+        throw std::invalid_argument("head_dim must be in [1, 256]");
+    }
+
+    const size_t query_count = checkedElementCount(
+        {static_cast<size_t>(batch_size),
+         static_cast<size_t>(target_seq_len),
+         static_cast<size_t>(query_heads)});
+    const size_t query_elements =
+        checkedElementCount({query_count, static_cast<size_t>(head_dim)});
+    const size_t kv_elements = checkedElementCount(
+        {static_cast<size_t>(batch_size), static_cast<size_t>(src_seq_len),
+         static_cast<size_t>(kv_heads), static_cast<size_t>(head_dim)});
+    if (h_q.size() != query_elements || h_k.size() != kv_elements ||
+        h_v.size() != kv_elements) {
+        throw std::invalid_argument("attention input size mismatch");
+    }
+    if (query_count == 0) {
+        h_o.clear();
+        return;
+    }
+
+    const int subwave_size =
+        std::is_same_v<T, float> || head_dim >= 64 ? 16 : 8;
+    const bool use_subwaves =
+        head_dim >= 16 && (head_dim & (head_dim - 1)) == 0;
+    const int subwave_block_size =
+        std::is_same_v<T, float> ? 1024 : kScalarAttentionBlockSize;
+    const int attention_block_size =
+        use_subwaves ? subwave_block_size : kScalarAttentionBlockSize;
+    const size_t queries_per_block =
+        use_subwaves ? attention_block_size / subwave_size
+                     : attention_block_size;
+    const size_t block_count =
+        (query_count + queries_per_block - 1) / queries_per_block;
+    if (block_count > std::numeric_limits<unsigned int>::max()) {
+        throw std::overflow_error("attention grid is too large");
+    }
+    const unsigned int grid_blocks = static_cast<unsigned int>(block_count);
+
+    const size_t query_bytes = checkedElementCount({query_elements, sizeof(T)});
+    const size_t kv_bytes = checkedElementCount({kv_elements, sizeof(T)});
+    h_o.resize(query_elements);
+
+    T* d_query = nullptr;
+    T* d_key = nullptr;
+    T* d_value = nullptr;
+    T* d_output = nullptr;
+    RUNTIME_CHECK(mcMalloc(reinterpret_cast<void**>(&d_query), query_bytes));
+    RUNTIME_CHECK(mcMalloc(reinterpret_cast<void**>(&d_key), kv_bytes));
+    RUNTIME_CHECK(mcMalloc(reinterpret_cast<void**>(&d_value), kv_bytes));
+    RUNTIME_CHECK(mcMalloc(reinterpret_cast<void**>(&d_output), query_bytes));
+    RUNTIME_CHECK(
+        mcMemcpy(d_query, h_q.data(), query_bytes, mcMemcpyHostToDevice));
+    RUNTIME_CHECK(
+        mcMemcpy(d_key, h_k.data(), kv_bytes, mcMemcpyHostToDevice));
+    RUNTIME_CHECK(
+        mcMemcpy(d_value, h_v.data(), kv_bytes, mcMemcpyHostToDevice));
+
+    if (use_subwaves) {
+#define LAUNCH_SUBWAVE(DIM)                                                   \
+    subwaveAttentionKernel<                                                  \
+        T, DIM, (std::is_same_v<T, float> || DIM >= 64 ? 16 : 8)>           \
+        <<<grid_blocks, attention_block_size>>>(                            \
+        d_query, d_key, d_value, d_output, batch_size, target_seq_len,       \
+        src_seq_len, query_heads, kv_heads, is_causal)
+        switch (head_dim) {
+            case 16:
+                LAUNCH_SUBWAVE(16);
+                break;
+            case 32:
+                LAUNCH_SUBWAVE(32);
+                break;
+            case 64:
+                LAUNCH_SUBWAVE(64);
+                break;
+            case 128:
+                LAUNCH_SUBWAVE(128);
+                break;
+            case 256:
+                LAUNCH_SUBWAVE(256);
+                break;
+        }
+#undef LAUNCH_SUBWAVE
+    } else {
+        scalarAttentionKernel<<<grid_blocks, attention_block_size>>>(
+            d_query, d_key, d_value, d_output, batch_size, target_seq_len,
+            src_seq_len, query_heads, kv_heads, head_dim, is_causal);
+    }
+    RUNTIME_CHECK(mcGetLastError());
+    RUNTIME_CHECK(mcMemcpy(h_o.data(), d_output, query_bytes,
+                           mcMemcpyDeviceToHost));
+
+    RUNTIME_CHECK(mcFree(d_output));
+    RUNTIME_CHECK(mcFree(d_value));
+    RUNTIME_CHECK(mcFree(d_key));
+    RUNTIME_CHECK(mcFree(d_query));
 }
 
 // *********************************************************************
 // Explicit Template Instantiations (REQUIRED FOR LINKING WITH TESTER.O)
 // DO NOT MODIFY THIS SECTION
 // *********************************************************************
-template void rmsNorm<float>(const std::vector<float>&, const std::vector<float>&,
-  std::vector<float>&, size_t, size_t, float);
+template void rmsNorm<float>(const std::vector<float>&,
+                             const std::vector<float>&, std::vector<float>&,
+                             size_t, size_t, float);
 template void rmsNorm<half>(const std::vector<half>&, const std::vector<half>&,
-  std::vector<half>&, size_t, size_t, float);
-template void flashAttention<float>(const std::vector<float>&, const std::vector<float>&,
-  const std::vector<float>&, std::vector<float>&,
-  int, int, int, int, int, int, bool);
-template void flashAttention<half>(const std::vector<half>&, const std::vector<half>&,
-  const std::vector<half>&, std::vector<half>&,
-  int, int, int, int, int, int, bool);
+                            std::vector<half>&, size_t, size_t, float);
+template void flashAttention<float>(const std::vector<float>&,
+                                    const std::vector<float>&,
+                                    const std::vector<float>&,
+                                    std::vector<float>&, int, int, int, int,
+                                    int, int, bool);
+template void flashAttention<half>(const std::vector<half>&,
+                                   const std::vector<half>&,
+                                   const std::vector<half>&, std::vector<half>&,
+                                   int, int, int, int, int, int, bool);

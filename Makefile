@@ -39,6 +39,7 @@ else ifeq ($(PLATFORM),moore)
 	EXTRA_LIBS		:= -I/usr/local/musa/include -L/usr/lib/gcc/x86_64-linux-gnu/11/ -L/usr/local/musa/lib -lmusart
 else ifeq ($(PLATFORM),metax)
     CC          	:= mxcc
+	CFLAGS         	:= -std=c++17 -O3
     TEST_OBJ    	:= tester/tester_metax.o
 	STUDENT_SUFFIX  := maca
 	PLATFORM_DEFINE := -DPLATFORM_METAX

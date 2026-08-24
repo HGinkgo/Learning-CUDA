@@ -117,6 +117,34 @@ Metrics compare(const std::vector<float>& expected,
     return metrics;
 }
 
+template <typename T, typename Decode>
+Metrics compare_typed(const std::vector<float>& expected,
+                      const std::vector<T>& actual,
+                      Decode decode) {
+    assert(expected.size() == actual.size());
+    Metrics metrics;
+    double squared_error = 0.0;
+    double absolute_error = 0.0;
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        const double error = static_cast<double>(decode(actual[index])) - expected[index];
+        metrics.max_abs = std::max(metrics.max_abs, std::fabs(error));
+        absolute_error += std::fabs(error);
+        squared_error += error * error;
+    }
+    const double count = static_cast<double>(expected.size());
+    metrics.mae = absolute_error / count;
+    metrics.mse = squared_error / count;
+    return metrics;
+}
+
+std::vector<low_precision::Fp16> to_fp16(const std::vector<float>& input) {
+    std::vector<low_precision::Fp16> output(input.size());
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        output[index] = low_precision::fp16_from_float(input[index]);
+    }
+    return output;
+}
+
 template <typename T>
 double milliseconds(T start, T end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
@@ -205,7 +233,7 @@ std::size_t count_mismatches(const std::vector<std::uint8_t>& expected,
 }
 
 void print_header() {
-    std::cout << "distribution,format,backend,rows,cols,elements,"
+    std::cout << "distribution,format,backend,input_type,output_type,rows,cols,elements,"
                  "api_quant_p50_ms,api_quant_min_ms,api_quant_std_ms,"
                  "device_quant_p50_ms,device_quant_min_ms,device_quant_std_ms,"
                  "api_dequant_p50_ms,api_dequant_min_ms,api_dequant_std_ms,"
@@ -224,15 +252,19 @@ void print_timing(const TimingStats& stats) {
 void print_row(Distribution distribution,
                const char* format,
                const char* backend,
+               const char* input_type,
+               const char* output_type,
                std::size_t rows,
                std::size_t cols,
                const Timings& timings,
                const Metrics& metrics,
                double compression_ratio,
                std::size_t input_bytes,
+               std::size_t output_bytes,
                std::size_t payload_bytes,
                std::size_t payload_mismatches) {
     std::cout << distribution_name(distribution) << ',' << format << ',' << backend << ','
+              << input_type << ',' << output_type << ','
               << rows << ',' << cols << ',' << rows * cols << ','
               ;
     print_timing(timings.api_quant);
@@ -244,7 +276,7 @@ void print_row(Distribution distribution,
               << metrics.mae << ',' << metrics.mse << ','
               << std::fixed << std::setprecision(4) << compression_ratio << ','
               << input_bytes << ',' << payload_bytes << ','
-              << payload_bytes << ',' << input_bytes << ','
+              << payload_bytes << ',' << output_bytes << ','
               << effective_bandwidth(input_bytes + payload_bytes,
                                      timings.api_quant.p50_ms) << ','
               << effective_bandwidth(input_bytes + payload_bytes,
@@ -274,10 +306,10 @@ void benchmark_mxfp8(const std::vector<float>& input,
     Timings cpu_timings;
     cpu_timings.api_quant = single_sample(milliseconds(cpu_quant_start, cpu_quant_end));
     cpu_timings.api_dequant = single_sample(milliseconds(cpu_dequant_start, cpu_dequant_end));
-    print_row(distribution, "mxfp8", "cpu", rows, cols,
+    print_row(distribution, "mxfp8", "cpu", "fp32", "fp32", rows, cols,
               cpu_timings, cpu_metrics,
               static_cast<double>(input_bytes) / payload_bytes,
-              input_bytes, payload_bytes, 0);
+              input_bytes, input_bytes, payload_bytes, 0);
 
     GpuBuffers buffers;
     buffers.input = device_alloc<float>(input.size());
@@ -338,9 +370,10 @@ void benchmark_mxfp8(const std::vector<float>& input,
     gpu_timings.device_quant = summarize(std::move(device_quant_samples));
     gpu_timings.api_dequant = summarize(std::move(api_dequant_samples));
     gpu_timings.device_dequant = summarize(std::move(device_dequant_samples));
-    print_row(distribution, "mxfp8", "cuda", rows, cols, gpu_timings, gpu_metrics,
+    print_row(distribution, "mxfp8", "cuda", "fp32", "fp32", rows, cols,
+              gpu_timings, gpu_metrics,
               static_cast<double>(input_bytes) / payload_bytes,
-              input_bytes, payload_bytes,
+              input_bytes, input_bytes, payload_bytes,
               count_mismatches(cpu_quantized.values, gpu_values) +
                   count_mismatches(cpu_quantized.scales, gpu_scales));
     free_buffers(buffers);
@@ -365,10 +398,10 @@ void benchmark_nvfp4(const std::vector<float>& input,
     Timings cpu_timings;
     cpu_timings.api_quant = single_sample(milliseconds(cpu_quant_start, cpu_quant_end));
     cpu_timings.api_dequant = single_sample(milliseconds(cpu_dequant_start, cpu_dequant_end));
-    print_row(distribution, "nvfp4", "cpu", rows, cols,
+    print_row(distribution, "nvfp4", "cpu", "fp32", "fp32", rows, cols,
               cpu_timings, cpu_metrics,
               static_cast<double>(input_bytes) / payload_bytes,
-              input_bytes, payload_bytes, 0);
+              input_bytes, input_bytes, payload_bytes, 0);
 
     GpuBuffers buffers;
     buffers.input = device_alloc<float>(input.size());
@@ -432,13 +465,173 @@ void benchmark_nvfp4(const std::vector<float>& input,
     gpu_timings.device_quant = summarize(std::move(device_quant_samples));
     gpu_timings.api_dequant = summarize(std::move(api_dequant_samples));
     gpu_timings.device_dequant = summarize(std::move(device_dequant_samples));
-    print_row(distribution, "nvfp4", "cuda", rows, cols, gpu_timings, gpu_metrics,
+    print_row(distribution, "nvfp4", "cuda", "fp32", "fp32", rows, cols,
+              gpu_timings, gpu_metrics,
               static_cast<double>(input_bytes) / payload_bytes,
-              input_bytes, payload_bytes,
+              input_bytes, input_bytes, payload_bytes,
               count_mismatches(cpu_quantized.values, gpu_values) +
                   count_mismatches(cpu_quantized.block_scales, gpu_scales) +
                   (gpu_global_scale != cpu_quantized.global_scale ? 1 : 0));
     free_buffers(buffers);
+}
+
+template <typename Output, typename Decode>
+void benchmark_mxfp8_typed(const std::vector<float>& input,
+                            std::size_t rows,
+                            std::size_t cols,
+                            Distribution distribution,
+                            int repeats,
+                            const char* output_type,
+                            Decode decode) {
+    const std::vector<low_precision::Fp16> half_input = to_fp16(input);
+    const auto cpu_quantized = low_precision::quantize_mxfp8(half_input, rows, cols);
+    const std::size_t payload_bytes = cpu_quantized.values.size() + cpu_quantized.scales.size();
+    const std::size_t input_bytes = half_input.size() * sizeof(low_precision::Fp16);
+    const std::size_t output_bytes = input.size() * sizeof(Output);
+
+    auto* d_input = device_alloc<low_precision::Fp16>(half_input.size());
+    auto* d_values = device_alloc<std::uint8_t>(cpu_quantized.values.size());
+    auto* d_scales = device_alloc<std::uint8_t>(cpu_quantized.scales.size());
+    auto* d_output = device_alloc<Output>(input.size());
+    check_cuda(cudaMemcpy(d_input, half_input.data(), input_bytes, cudaMemcpyHostToDevice),
+               "copy typed input");
+    low_precision::cuda_quantize_mxfp8(d_input, d_values, d_scales, rows, cols);
+    low_precision::cuda_dequantize_mxfp8(d_values, d_scales, d_output, rows, cols);
+
+    std::vector<std::uint8_t> gpu_values(cpu_quantized.values.size());
+    std::vector<std::uint8_t> gpu_scales(cpu_quantized.scales.size());
+    std::vector<Output> gpu_output(input.size());
+    std::vector<double> api_quant_samples;
+    std::vector<double> device_quant_samples;
+    std::vector<double> api_dequant_samples;
+    std::vector<double> device_dequant_samples;
+    api_quant_samples.reserve(static_cast<std::size_t>(repeats));
+    device_quant_samples.reserve(static_cast<std::size_t>(repeats));
+    api_dequant_samples.reserve(static_cast<std::size_t>(repeats));
+    device_dequant_samples.reserve(static_cast<std::size_t>(repeats));
+    CudaEvents events;
+    for (int iteration = 0; iteration < repeats; ++iteration) {
+        const TimedSample quant = measure_cuda(
+            [&] {
+                low_precision::cuda_quantize_mxfp8(d_input, d_values, d_scales,
+                                                   rows, cols);
+            },
+            events);
+        api_quant_samples.push_back(quant.api_ms);
+        device_quant_samples.push_back(quant.device_ms);
+        const TimedSample dequant = measure_cuda(
+            [&] {
+                low_precision::cuda_dequantize_mxfp8(d_values, d_scales, d_output,
+                                                     rows, cols);
+            },
+            events);
+        api_dequant_samples.push_back(dequant.api_ms);
+        device_dequant_samples.push_back(dequant.device_ms);
+    }
+    check_cuda(cudaMemcpy(gpu_values.data(), d_values, gpu_values.size(), cudaMemcpyDeviceToHost),
+               "copy typed MXFP8 values");
+    check_cuda(cudaMemcpy(gpu_scales.data(), d_scales, gpu_scales.size(), cudaMemcpyDeviceToHost),
+               "copy typed MXFP8 scales");
+    check_cuda(cudaMemcpy(gpu_output.data(), d_output, output_bytes, cudaMemcpyDeviceToHost),
+               "copy typed MXFP8 output");
+    Timings timings;
+    timings.api_quant = summarize(std::move(api_quant_samples));
+    timings.device_quant = summarize(std::move(device_quant_samples));
+    timings.api_dequant = summarize(std::move(api_dequant_samples));
+    timings.device_dequant = summarize(std::move(device_dequant_samples));
+    const Metrics metrics = compare_typed(input, gpu_output, decode);
+    print_row(distribution, "mxfp8", "cuda", "fp16", output_type, rows, cols,
+              timings, metrics,
+              static_cast<double>(input_bytes) / payload_bytes,
+              input_bytes, output_bytes, payload_bytes,
+              count_mismatches(cpu_quantized.values, gpu_values) +
+                  count_mismatches(cpu_quantized.scales, gpu_scales));
+    cudaFree(d_output);
+    cudaFree(d_scales);
+    cudaFree(d_values);
+    cudaFree(d_input);
+}
+
+template <typename Output, typename Decode>
+void benchmark_nvfp4_typed(const std::vector<float>& input,
+                            std::size_t rows,
+                            std::size_t cols,
+                            Distribution distribution,
+                            int repeats,
+                            const char* output_type,
+                            Decode decode) {
+    const std::vector<low_precision::Fp16> half_input = to_fp16(input);
+    const auto cpu_quantized = low_precision::quantize_nvfp4(half_input, rows, cols);
+    const std::size_t payload_bytes = cpu_quantized.values.size() +
+                                      cpu_quantized.block_scales.size() + sizeof(float);
+    const std::size_t input_bytes = half_input.size() * sizeof(low_precision::Fp16);
+    const std::size_t output_bytes = input.size() * sizeof(Output);
+
+    auto* d_input = device_alloc<low_precision::Fp16>(half_input.size());
+    auto* d_values = device_alloc<std::uint8_t>(cpu_quantized.values.size());
+    auto* d_scales = device_alloc<std::uint8_t>(cpu_quantized.block_scales.size());
+    auto* d_output = device_alloc<Output>(input.size());
+    float global_scale = 0.0f;
+    check_cuda(cudaMemcpy(d_input, half_input.data(), input_bytes, cudaMemcpyHostToDevice),
+               "copy typed input");
+    low_precision::cuda_quantize_nvfp4(d_input, d_values, d_scales, rows, cols,
+                                       &global_scale);
+    low_precision::cuda_dequantize_nvfp4(d_values, d_scales, global_scale,
+                                         d_output, rows, cols);
+
+    std::vector<std::uint8_t> gpu_values(cpu_quantized.values.size());
+    std::vector<std::uint8_t> gpu_scales(cpu_quantized.block_scales.size());
+    std::vector<Output> gpu_output(input.size());
+    std::vector<double> api_quant_samples;
+    std::vector<double> device_quant_samples;
+    std::vector<double> api_dequant_samples;
+    std::vector<double> device_dequant_samples;
+    api_quant_samples.reserve(static_cast<std::size_t>(repeats));
+    device_quant_samples.reserve(static_cast<std::size_t>(repeats));
+    api_dequant_samples.reserve(static_cast<std::size_t>(repeats));
+    device_dequant_samples.reserve(static_cast<std::size_t>(repeats));
+    CudaEvents events;
+    for (int iteration = 0; iteration < repeats; ++iteration) {
+        const TimedSample quant = measure_cuda(
+            [&] {
+                low_precision::cuda_quantize_nvfp4(d_input, d_values, d_scales,
+                                                   rows, cols, &global_scale);
+            },
+            events);
+        api_quant_samples.push_back(quant.api_ms);
+        device_quant_samples.push_back(quant.device_ms);
+        const TimedSample dequant = measure_cuda(
+            [&] {
+                low_precision::cuda_dequantize_nvfp4(d_values, d_scales, global_scale,
+                                                     d_output, rows, cols);
+            },
+            events);
+        api_dequant_samples.push_back(dequant.api_ms);
+        device_dequant_samples.push_back(dequant.device_ms);
+    }
+    check_cuda(cudaMemcpy(gpu_values.data(), d_values, gpu_values.size(), cudaMemcpyDeviceToHost),
+               "copy typed NVFP4 values");
+    check_cuda(cudaMemcpy(gpu_scales.data(), d_scales, gpu_scales.size(), cudaMemcpyDeviceToHost),
+               "copy typed NVFP4 scales");
+    check_cuda(cudaMemcpy(gpu_output.data(), d_output, output_bytes, cudaMemcpyDeviceToHost),
+               "copy typed NVFP4 output");
+    Timings timings;
+    timings.api_quant = summarize(std::move(api_quant_samples));
+    timings.device_quant = summarize(std::move(device_quant_samples));
+    timings.api_dequant = summarize(std::move(api_dequant_samples));
+    timings.device_dequant = summarize(std::move(device_dequant_samples));
+    const Metrics metrics = compare_typed(input, gpu_output, decode);
+    print_row(distribution, "nvfp4", "cuda", "fp16", output_type, rows, cols,
+              timings, metrics,
+              static_cast<double>(input_bytes) / payload_bytes,
+              input_bytes, output_bytes, payload_bytes,
+              count_mismatches(cpu_quantized.values, gpu_values) +
+                  count_mismatches(cpu_quantized.block_scales, gpu_scales) +
+                  (global_scale != cpu_quantized.global_scale ? 1 : 0));
+    cudaFree(d_output);
+    cudaFree(d_scales);
+    cudaFree(d_values);
+    cudaFree(d_input);
 }
 
 }  // namespace
@@ -486,6 +679,18 @@ int main(int argc, char** argv) {
                 const std::vector<float> input = make_input(rows, cols, distribution);
                 benchmark_mxfp8(input, rows, cols, distribution, repeats);
                 benchmark_nvfp4(input, rows, cols, distribution, repeats);
+                benchmark_mxfp8_typed<low_precision::Fp16>(
+                    input, rows, cols, distribution, repeats,
+                    "fp16", low_precision::fp16_to_float);
+                benchmark_mxfp8_typed<low_precision::Bf16>(
+                    input, rows, cols, distribution, repeats,
+                    "bf16", low_precision::bf16_to_float);
+                benchmark_nvfp4_typed<low_precision::Fp16>(
+                    input, rows, cols, distribution, repeats,
+                    "fp16", low_precision::fp16_to_float);
+                benchmark_nvfp4_typed<low_precision::Bf16>(
+                    input, rows, cols, distribution, repeats,
+                    "bf16", low_precision::bf16_to_float);
             }
         }
     } catch (const std::exception& error) {

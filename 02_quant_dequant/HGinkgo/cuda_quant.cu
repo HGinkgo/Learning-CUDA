@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace low_precision {
 namespace {
@@ -44,8 +43,8 @@ std::size_t block_count(std::size_t cols, std::size_t block_size) {
 template <typename T>
 class DeviceBuffer {
 public:
-    explicit DeviceBuffer(std::size_t count) : count_(count) {
-        check_cuda(cudaMalloc(&pointer_, count_ * sizeof(T)), "cudaMalloc");
+    explicit DeviceBuffer(std::size_t count) {
+        check_cuda(cudaMalloc(&pointer_, count * sizeof(T)), "cudaMalloc");
     }
 
     ~DeviceBuffer() {
@@ -60,7 +59,6 @@ public:
     T* get() { return pointer_; }
 
 private:
-    std::size_t count_;
     T* pointer_ = nullptr;
 };
 
@@ -145,6 +143,19 @@ __device__ unsigned encode_e4m3_device(float value) {
 
 __device__ float decode_e8m0_device(unsigned code) {
     return ldexpf(1.0f, static_cast<int>(code) - 127);
+}
+
+__device__ std::uint8_t encode_e8m0_device(float scale) {
+    if (!(scale > 0.0f) || !isfinite(scale)) {
+        return 127;
+    }
+    int exponent = 0;
+    const float mantissa = frexpf(scale, &exponent);
+    if (mantissa == 0.5f) {
+        --exponent;
+    }
+    exponent = max(0, min(254, exponent + 127));
+    return static_cast<std::uint8_t>(exponent);
 }
 
 __device__ float fp16_to_float_device(Fp16 value) {
@@ -238,6 +249,19 @@ __global__ void block_amax_kernel(const float* input,
     if (threadIdx.x == 0) {
         block_amax[block_index] = shared[0];
     }
+}
+
+__global__ void encode_mxfp8_scales_kernel(const float* block_amax,
+                                           std::uint8_t* scales,
+                                           std::size_t block_count_total) {
+    const std::size_t block_index = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                                    threadIdx.x;
+    if (block_index >= block_count_total) {
+        return;
+    }
+    const float block_max = block_amax[block_index];
+    const float requested_scale = block_max == 0.0f ? 1.0f : block_max / kMxFp8Max;
+    scales[block_index] = encode_e8m0_device(requested_scale);
 }
 
 __global__ void nvfp4_block_amax_kernel(const float* input,
@@ -380,23 +404,15 @@ void cuda_quantize_mxfp8(const float* d_input,
                          std::size_t cols) {
     check_shape(rows, cols);
     const std::size_t blocks_per_row = block_count(cols, kMxBlock);
+    const std::size_t block_count_total = rows * blocks_per_row;
     DeviceBuffer<float> d_amax(rows * blocks_per_row);
-    std::vector<float> h_amax(rows * blocks_per_row);
     const dim3 reduction_grid(static_cast<unsigned>(rows * blocks_per_row));
     block_amax_kernel<<<reduction_grid, 32>>>(d_input, d_amax.get(), rows, cols,
                                               kMxBlock, blocks_per_row);
     check_kernel("MXFP8 block amax");
-    check_cuda(cudaMemcpy(h_amax.data(), d_amax.get(), h_amax.size() * sizeof(float),
-                          cudaMemcpyDeviceToHost),
-               "MXFP8 amax copy");
-
-    std::vector<std::uint8_t> h_scales(h_amax.size());
-    for (std::size_t i = 0; i < h_amax.size(); ++i) {
-        const float requested_scale = h_amax[i] == 0.0f ? 1.0f : h_amax[i] / kMxFp8Max;
-        h_scales[i] = encode_e8m0(requested_scale);
-    }
-    check_cuda(cudaMemcpy(d_scales, h_scales.data(), h_scales.size(), cudaMemcpyHostToDevice),
-               "MXFP8 scale copy");
+    encode_mxfp8_scales_kernel<<<static_cast<unsigned>((block_count_total + 255) / 256), 256>>>(
+        d_amax.get(), d_scales, block_count_total);
+    check_kernel("MXFP8 scale encode");
 
     const std::size_t element_count = rows * cols;
     quantize_mxfp8_kernel<<<static_cast<unsigned>((element_count + 255) / 256), 256>>>(

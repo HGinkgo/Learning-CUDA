@@ -1,5 +1,5 @@
-#include "cuda_quant.hpp"
-#include "quant.hpp"
+#include "low_precision/cuda_quant.hpp"
+#include "low_precision/quant.hpp"
 
 #include <cuda_runtime.h>
 

@@ -8,6 +8,8 @@
 - `NearestEven` 和 `Stochastic` 均提供接口；默认测试使用 `NearestEven`。
 - `Fp16` 和 `Bf16` 使用明确的 16-bit storage wrapper；FP16 输入可直接量化，MXFP8/NVFP4 解量化可输出 FP32、FP16 或 BF16。
 
+目录按共享代码和后端实现分层：`include/low_precision` 保存公共接口，`common` 保存 CPU reference 与文件格式，`backends/nvidia` 保存 NVIDIA CUDA kernel，`apps` 保存 CLI/benchmark，`tests` 保存验证脚本。后续国产平台在 `backends/iluvatar`、`backends/metax` 或 `backends/moore_threads` 中实现同一后端接口，不复制公共代码。
+
 构建和测试：
 
 ```bash
@@ -45,7 +47,7 @@ CLI 使用 little-endian 原始输入和量化文件：
 CSV 还包含 `input_type` 和 `output_type` 列；CUDA benchmark 会额外测量 FP16 输入到 FP16/BF16 输出的路径。CLI 文件读写端到端计时可运行：
 
 ```bash
-./benchmark_cli.sh ./build/quant_cli 1024 2048
+./apps/benchmark_cli.sh ./build/quant_cli 1024 2048
 ```
 
 真正走 CUDA kernel 的文件工作流使用 `cuda_quant_cli`：

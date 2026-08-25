@@ -1,4 +1,4 @@
-#include "quant.hpp"
+#include "low_precision/quant.hpp"
 
 #include <algorithm>
 #include <cmath>

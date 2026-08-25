@@ -1,6 +1,6 @@
 #pragma once
 
-#include "quant.hpp"
+#include "low_precision/quant.hpp"
 
 #include <cstddef>
 #include <cstdint>

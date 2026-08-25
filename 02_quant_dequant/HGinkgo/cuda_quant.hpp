@@ -11,13 +11,17 @@ void cuda_quantize_mxfp8(const float* d_input,
                          std::uint8_t* d_values,
                          std::uint8_t* d_scales,
                          std::size_t rows,
-                         std::size_t cols);
+                         std::size_t cols,
+                         Rounding rounding = Rounding::NearestEven,
+                         std::uint64_t seed = 0);
 
 void cuda_quantize_mxfp8(const Fp16* d_input,
                          std::uint8_t* d_values,
                          std::uint8_t* d_scales,
                          std::size_t rows,
-                         std::size_t cols);
+                         std::size_t cols,
+                         Rounding rounding = Rounding::NearestEven,
+                         std::uint64_t seed = 0);
 
 void cuda_dequantize_mxfp8(const std::uint8_t* d_values,
                            const std::uint8_t* d_scales,
@@ -42,14 +46,18 @@ void cuda_quantize_nvfp4(const float* d_input,
                          std::uint8_t* d_block_scales,
                          std::size_t rows,
                          std::size_t cols,
-                         float* global_scale);
+                         float* global_scale,
+                         Rounding rounding = Rounding::NearestEven,
+                         std::uint64_t seed = 0);
 
 void cuda_quantize_nvfp4(const Fp16* d_input,
                          std::uint8_t* d_values,
                          std::uint8_t* d_block_scales,
                          std::size_t rows,
                          std::size_t cols,
-                         float* global_scale);
+                         float* global_scale,
+                         Rounding rounding = Rounding::NearestEven,
+                         std::uint64_t seed = 0);
 
 void cuda_dequantize_nvfp4(const std::uint8_t* d_values,
                            const std::uint8_t* d_block_scales,

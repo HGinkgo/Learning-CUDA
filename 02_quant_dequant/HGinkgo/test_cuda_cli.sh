@@ -39,9 +39,26 @@ printf '\x00\x00\x80\x3f\x00\x00\x00\xc0\x00\x00\x00\x3f\x00\x00\x80\x40\x00\x00
 "${cpu_cli}" quantize --input "${workdir}/input_nv.bin" --output "${workdir}/cpu_nv.qnt" \
   --rows 1 --cols 5 --input-type fp32 --format nvfp4 --rounding nearest
 cmp "${workdir}/cuda_nv.qnt" "${workdir}/cpu_nv.qnt"
+"${cli}" quantize --input "${workdir}/input_nv.bin" \
+  --output "${workdir}/stochastic_nv_a.qnt" --rows 1 --cols 5 --input-type fp32 \
+  --format nvfp4 --rounding stochastic --seed 29
+"${cli}" quantize --input "${workdir}/input_nv.bin" \
+  --output "${workdir}/stochastic_nv_b.qnt" --rows 1 --cols 5 --input-type fp32 \
+  --format nvfp4 --rounding stochastic --seed 29
+cmp "${workdir}/stochastic_nv_a.qnt" "${workdir}/stochastic_nv_b.qnt"
 
-if "${cli}" quantize --input "${workdir}/input.bin" --output "${workdir}/bad.qnt" \
-  --rows 1 --cols 4 --input-type fp32 --format mxfp8 --rounding stochastic \
-  >/dev/null 2>&1; then
+printf '\xcd\xcc\x8c\x3f\x33\x33\x13\xc0\xa4\x70\xbd\x3e\x66\x66\x96\x40' \
+  > "${workdir}/input_stochastic.bin"
+"${cli}" quantize --input "${workdir}/input_stochastic.bin" \
+  --output "${workdir}/stochastic_a.qnt" --rows 1 --cols 4 --input-type fp32 \
+  --format mxfp8 --rounding stochastic --seed 17
+"${cli}" quantize --input "${workdir}/input_stochastic.bin" \
+  --output "${workdir}/stochastic_b.qnt" --rows 1 --cols 4 --input-type fp32 \
+  --format mxfp8 --rounding stochastic --seed 17
+cmp "${workdir}/stochastic_a.qnt" "${workdir}/stochastic_b.qnt"
+"${cli}" quantize --input "${workdir}/input_stochastic.bin" \
+  --output "${workdir}/nearest_stochastic.qnt" --rows 1 --cols 4 --input-type fp32 \
+  --format mxfp8 --rounding nearest
+if cmp -s "${workdir}/nearest_stochastic.qnt" "${workdir}/stochastic_a.qnt"; then
   exit 1
 fi

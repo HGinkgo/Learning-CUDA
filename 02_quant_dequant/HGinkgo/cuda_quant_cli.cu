@@ -27,6 +27,7 @@ struct Options {
     OutputType output_type = OutputType::Fp32;
     low_precision::Format format = low_precision::Format::MxFp8;
     low_precision::Rounding rounding = low_precision::Rounding::NearestEven;
+    std::uint64_t seed = 0;
     bool has_rows = false;
     bool has_cols = false;
     bool has_input_type = false;
@@ -39,7 +40,7 @@ struct Options {
         message +
         "\nusage: cuda_quant_cli quantize --input IN --output OUT "
         "--rows R --cols C --input-type fp32|fp16 "
-        "--format mxfp8|nvfp4 --rounding nearest\n"
+        "--format mxfp8|nvfp4 --rounding nearest|stochastic [--seed N]\n"
         "       cuda_quant_cli dequantize --input IN --output OUT "
         "--output-type fp32|fp16|bf16");
 }
@@ -62,6 +63,19 @@ std::size_t parse_size(const std::string& value, const char* name) {
         return static_cast<std::size_t>(parsed);
     } catch (const std::exception&) {
         usage_error(std::string("invalid ") + name);
+    }
+}
+
+std::uint64_t parse_seed(const std::string& value) {
+    try {
+        std::size_t consumed = 0;
+        const unsigned long long parsed = std::stoull(value, &consumed);
+        if (consumed != value.size()) {
+            usage_error("invalid seed");
+        }
+        return static_cast<std::uint64_t>(parsed);
+    } catch (const std::exception&) {
+        usage_error("invalid seed");
     }
 }
 
@@ -128,10 +142,12 @@ Options parse_options(int argc, char** argv) {
             if (value == "nearest") {
                 options.rounding = low_precision::Rounding::NearestEven;
             } else if (value == "stochastic") {
-                usage_error("CUDA quantization currently supports nearest rounding only");
+                options.rounding = low_precision::Rounding::Stochastic;
             } else {
                 usage_error("invalid rounding mode");
             }
+        } else if (option == "--seed" && options.mode == Mode::Quantize) {
+            options.seed = parse_seed(value);
         } else {
             usage_error("unknown or misplaced option: " + option);
         }
@@ -247,11 +263,13 @@ low_precision::QuantizedFile quantize(const Options& options) {
                    "copy FP32 input");
         if (options.format == low_precision::Format::MxFp8) {
             low_precision::cuda_quantize_mxfp8(d_input.get(), d_values.get(), d_scales.get(),
-                                                options.rows, options.cols);
+                                                options.rows, options.cols, options.rounding,
+                                                options.seed);
         } else {
             float global_scale = 0.0f;
             low_precision::cuda_quantize_nvfp4(d_input.get(), d_values.get(), d_scales.get(),
-                                                options.rows, options.cols, &global_scale);
+                                                options.rows, options.cols, &global_scale,
+                                                options.rounding, options.seed);
             file.global_scale = global_scale;
         }
     } else {
@@ -261,11 +279,13 @@ low_precision::QuantizedFile quantize(const Options& options) {
                    "copy FP16 input");
         if (options.format == low_precision::Format::MxFp8) {
             low_precision::cuda_quantize_mxfp8(d_input.get(), d_values.get(), d_scales.get(),
-                                                options.rows, options.cols);
+                                                options.rows, options.cols, options.rounding,
+                                                options.seed);
         } else {
             float global_scale = 0.0f;
             low_precision::cuda_quantize_nvfp4(d_input.get(), d_values.get(), d_scales.get(),
-                                                options.rows, options.cols, &global_scale);
+                                                options.rows, options.cols, &global_scale,
+                                                options.rounding, options.seed);
             file.global_scale = global_scale;
         }
     }

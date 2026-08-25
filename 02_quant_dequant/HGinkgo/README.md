@@ -52,12 +52,12 @@ CSV 还包含 `input_type` 和 `output_type` 列；CUDA benchmark 会额外测�
 
 ```bash
 ./build/cuda_quant_cli quantize --input input.bin --output tensor.qnt \
-  --rows 1024 --cols 2048 --input-type fp16 --format nvfp4 --rounding nearest
+  --rows 1024 --cols 2048 --input-type fp16 --format nvfp4 --rounding stochastic --seed 17
 ./build/cuda_quant_cli dequantize --input tensor.qnt --output output.bin \
   --output-type bf16
 ```
 
-该 CLI 将输入复制到 GPU，调用 CUDA 量化/反量化 API，再将 packed payload、scale 或输出张量写回文件。当前 CUDA 量化文件路径只接受 `nearest`；CPU reference CLI 仍提供 `stochastic` 作为对照实现。
+该 CLI 将输入复制到 GPU，调用 CUDA 量化/反量化 API，再将 packed payload、scale 或输出张量写回文件。CUDA 量化支持 `nearest` 和带显式 seed 的 `stochastic`；同一 seed 可复现相同 payload。CPU reference CLI 仍保留用于逐字节对照。
 
 MXFP8 的 block scale 编码以及 NVFP4 的 block `amax`、global `amax`、block scale 编码和 packed payload 均在 CUDA 上完成；NVFP4 host 端只往返一个 global scale。
 

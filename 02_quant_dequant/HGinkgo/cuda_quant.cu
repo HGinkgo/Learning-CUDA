@@ -76,7 +76,17 @@ __device__ float decode_e2m1_device(unsigned code) {
     return (code & 0x08u) != 0 ? -value : value;
 }
 
-__device__ unsigned encode_e2m1_device(float value) {
+__device__ float random_uniform_device(std::uint64_t seed) {
+    std::uint64_t value = seed + 0x9e3779b97f4a7c15ull;
+    value = (value ^ (value >> 30u)) * 0xbf58476d1ce4e5b9ull;
+    value = (value ^ (value >> 27u)) * 0x94d049bb133111ebull;
+    value ^= value >> 31u;
+    return static_cast<float>(value >> 40u) * (1.0f / 16777216.0f);
+}
+
+__device__ unsigned encode_e2m1_device(float value,
+                                       Rounding rounding,
+                                       std::uint64_t random_seed) {
     const bool negative = signbit(value);
     const float magnitude = fminf(fabsf(value), kNvFp4Max);
     unsigned lower = 0;
@@ -92,11 +102,18 @@ __device__ unsigned encode_e2m1_device(float value) {
         }
     }
     unsigned selected = lower;
-    const float lower_distance = magnitude - decode_e2m1_device(lower);
-    const float upper_distance = decode_e2m1_device(upper) - magnitude;
-    if (upper_distance < lower_distance ||
-        (upper_distance == lower_distance && (lower & 1u) != 0u)) {
-        selected = upper;
+    const float lower_value = decode_e2m1_device(lower);
+    const float upper_value = decode_e2m1_device(upper);
+    if (rounding == Rounding::Stochastic && lower != upper && magnitude < kNvFp4Max) {
+        const float probability = (magnitude - lower_value) / (upper_value - lower_value);
+        selected = random_uniform_device(random_seed) < probability ? upper : lower;
+    } else {
+        const float lower_distance = magnitude - lower_value;
+        const float upper_distance = upper_value - magnitude;
+        if (upper_distance < lower_distance ||
+            (upper_distance == lower_distance && (lower & 1u) != 0u)) {
+            selected = upper;
+        }
     }
     return negative ? selected | 0x08u : selected;
 }
@@ -116,7 +133,9 @@ __device__ float decode_e4m3_device(unsigned code) {
     return (code & 0x80u) != 0 ? -magnitude : magnitude;
 }
 
-__device__ unsigned encode_e4m3_device(float value) {
+__device__ unsigned encode_e4m3_device(float value,
+                                       Rounding rounding = Rounding::NearestEven,
+                                       std::uint64_t random_seed = 0) {
     const bool negative = signbit(value);
     const float magnitude = fminf(fabsf(value), kMxFp8Max);
     unsigned lower = 0;
@@ -132,11 +151,18 @@ __device__ unsigned encode_e4m3_device(float value) {
         }
     }
     unsigned selected = lower;
-    const float lower_distance = magnitude - decode_e4m3_magnitude_device(lower);
-    const float upper_distance = decode_e4m3_magnitude_device(upper) - magnitude;
-    if (upper_distance < lower_distance ||
-        (upper_distance == lower_distance && (lower & 1u) != 0u)) {
-        selected = upper;
+    const float lower_value = decode_e4m3_magnitude_device(lower);
+    const float upper_value = decode_e4m3_magnitude_device(upper);
+    if (rounding == Rounding::Stochastic && lower != upper && magnitude < kMxFp8Max) {
+        const float probability = (magnitude - lower_value) / (upper_value - lower_value);
+        selected = random_uniform_device(random_seed) < probability ? upper : lower;
+    } else {
+        const float lower_distance = magnitude - lower_value;
+        const float upper_distance = upper_value - magnitude;
+        if (upper_distance < lower_distance ||
+            (upper_distance == lower_distance && (lower & 1u) != 0u)) {
+            selected = upper;
+        }
     }
     return negative ? selected | 0x80u : selected;
 }
@@ -287,7 +313,9 @@ __global__ void select_nvfp4_global_scale_kernel(const float* global_amax,
 __global__ void encode_nvfp4_scales_kernel(const float* block_amax,
                                            const float* global_scale,
                                            std::uint8_t* block_scales,
-                                           std::size_t block_count_total) {
+                                           std::size_t block_count_total,
+                                           Rounding rounding,
+                                           std::uint64_t seed) {
     const std::size_t block_index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (block_index >= block_count_total) {
         return;
@@ -298,7 +326,8 @@ __global__ void encode_nvfp4_scales_kernel(const float* block_amax,
                                       ? 1.0f
                                       : fmaxf((block_max / kNvFp4Max) / selected_global_scale,
                                               decode_e4m3_magnitude_device(0x01));
-    block_scales[block_index] = static_cast<std::uint8_t>(encode_e4m3_device(requested_scale));
+    block_scales[block_index] = static_cast<std::uint8_t>(
+        encode_e4m3_device(requested_scale, rounding, seed ^ (block_index * 0x9e3779b97f4a7c15ull)));
 }
 
 template <typename Input>
@@ -307,7 +336,9 @@ __global__ void quantize_mxfp8_kernel(const Input* input,
                                       const std::uint8_t* scales,
                                       std::size_t rows,
                                       std::size_t cols,
-                                      std::size_t blocks_per_row) {
+                                      std::size_t blocks_per_row,
+                                      Rounding rounding,
+                                      std::uint64_t seed) {
     const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (index >= rows * cols) {
         return;
@@ -317,7 +348,8 @@ __global__ void quantize_mxfp8_kernel(const Input* input,
     const std::size_t block = col / kMxBlock;
     const float scale = decode_e8m0_device(scales[row * blocks_per_row + block]);
     values[index] = static_cast<std::uint8_t>(
-        encode_e4m3_device(load_input_device(input[index]) / scale));
+        encode_e4m3_device(load_input_device(input[index]) / scale, rounding,
+                           seed ^ (index * 0x9e3779b97f4a7c15ull)));
 }
 
 template <typename Output>
@@ -346,7 +378,9 @@ __global__ void quantize_nvfp4_kernel(const Input* input,
                                       const float* global_scale,
                                       std::size_t rows,
                                       std::size_t cols,
-                                      std::size_t blocks_per_row) {
+                                      std::size_t blocks_per_row,
+                                      Rounding rounding,
+                                      std::uint64_t seed) {
     const std::size_t pair = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t element_count = rows * cols;
     if (pair >= (element_count + 1) / 2) {
@@ -360,14 +394,19 @@ __global__ void quantize_nvfp4_kernel(const Input* input,
     const float selected_global_scale = *global_scale;
     const float first_scale = selected_global_scale *
                               decode_e4m3_device(block_scales[first_row * blocks_per_row + first_block]);
-    unsigned packed = encode_e2m1_device(load_input_device(input[first]) / first_scale);
+    unsigned packed = encode_e2m1_device(
+        load_input_device(input[first]) / first_scale, rounding,
+        seed ^ (first * 0x9e3779b97f4a7c15ull));
     if (second < element_count) {
         const std::size_t second_row = second / cols;
         const std::size_t second_col = second % cols;
         const std::size_t second_block = second_col / kNvBlock;
         const float second_scale = selected_global_scale *
                                    decode_e4m3_device(block_scales[second_row * blocks_per_row + second_block]);
-        packed |= encode_e2m1_device(load_input_device(input[second]) / second_scale) << 4u;
+        packed |= encode_e2m1_device(
+                      load_input_device(input[second]) / second_scale, rounding,
+                      seed ^ (second * 0x9e3779b97f4a7c15ull))
+                  << 4u;
     }
     values[pair] = static_cast<std::uint8_t>(packed);
 }
@@ -399,7 +438,9 @@ void cuda_quantize_mxfp8_impl(const Input* d_input,
                               std::uint8_t* d_values,
                               std::uint8_t* d_scales,
                               std::size_t rows,
-                              std::size_t cols) {
+                              std::size_t cols,
+                              Rounding rounding,
+                              std::uint64_t seed) {
     check_shape(rows, cols);
     const std::size_t blocks_per_row = block_count(cols, kMxBlock);
     const std::size_t block_count_total = rows * blocks_per_row;
@@ -413,7 +454,7 @@ void cuda_quantize_mxfp8_impl(const Input* d_input,
 
     const std::size_t element_count = rows * cols;
     quantize_mxfp8_kernel<Input><<<element_grid(element_count), 256>>>(
-        d_input, d_values, d_scales, rows, cols, blocks_per_row);
+        d_input, d_values, d_scales, rows, cols, blocks_per_row, rounding, seed);
     check_kernel("MXFP8 quantize");
 }
 
@@ -437,7 +478,9 @@ void cuda_quantize_nvfp4_impl(const Input* d_input,
                               std::uint8_t* d_block_scales,
                               std::size_t rows,
                               std::size_t cols,
-                              float* global_scale) {
+                              float* global_scale,
+                              Rounding rounding,
+                              std::uint64_t seed) {
     check_shape(rows, cols);
     const std::size_t blocks_per_row = block_count(cols, kNvBlock);
     const std::size_t block_count_total = rows * blocks_per_row;
@@ -453,12 +496,13 @@ void cuda_quantize_nvfp4_impl(const Input* d_input,
     check_kernel("NVFP4 global scale select");
 
     encode_nvfp4_scales_kernel<<<static_cast<unsigned>((block_count_total + 255) / 256), 256>>>(
-        d_amax.get(), d_global_scale.get(), d_block_scales, block_count_total);
+        d_amax.get(), d_global_scale.get(), d_block_scales, block_count_total, rounding, seed);
     check_kernel("NVFP4 block scale encode");
 
     const std::size_t packed_count = (rows * cols + 1) / 2;
     quantize_nvfp4_kernel<Input><<<element_grid(packed_count), 256>>>(
-        d_input, d_values, d_block_scales, d_global_scale.get(), rows, cols, blocks_per_row);
+        d_input, d_values, d_block_scales, d_global_scale.get(), rows, cols, blocks_per_row,
+        rounding, seed);
     check_kernel("NVFP4 quantize");
     if (global_scale != nullptr) {
         check_cuda(cudaMemcpy(global_scale, d_global_scale.get(), sizeof(float),
@@ -488,16 +532,20 @@ void cuda_quantize_mxfp8(const float* d_input,
                          std::uint8_t* d_values,
                          std::uint8_t* d_scales,
                          std::size_t rows,
-                         std::size_t cols) {
-    cuda_quantize_mxfp8_impl(d_input, d_values, d_scales, rows, cols);
+                         std::size_t cols,
+                         Rounding rounding,
+                         std::uint64_t seed) {
+    cuda_quantize_mxfp8_impl(d_input, d_values, d_scales, rows, cols, rounding, seed);
 }
 
 void cuda_quantize_mxfp8(const Fp16* d_input,
                          std::uint8_t* d_values,
                          std::uint8_t* d_scales,
                          std::size_t rows,
-                         std::size_t cols) {
-    cuda_quantize_mxfp8_impl(d_input, d_values, d_scales, rows, cols);
+                         std::size_t cols,
+                         Rounding rounding,
+                         std::uint64_t seed) {
+    cuda_quantize_mxfp8_impl(d_input, d_values, d_scales, rows, cols, rounding, seed);
 }
 
 void cuda_dequantize_mxfp8(const std::uint8_t* d_values,
@@ -529,9 +577,11 @@ void cuda_quantize_nvfp4(const float* d_input,
                          std::uint8_t* d_block_scales,
                          std::size_t rows,
                          std::size_t cols,
-                         float* global_scale) {
+                         float* global_scale,
+                         Rounding rounding,
+                         std::uint64_t seed) {
     cuda_quantize_nvfp4_impl(d_input, d_values, d_block_scales,
-                             rows, cols, global_scale);
+                             rows, cols, global_scale, rounding, seed);
 }
 
 void cuda_quantize_nvfp4(const Fp16* d_input,
@@ -539,9 +589,11 @@ void cuda_quantize_nvfp4(const Fp16* d_input,
                          std::uint8_t* d_block_scales,
                          std::size_t rows,
                          std::size_t cols,
-                         float* global_scale) {
+                         float* global_scale,
+                         Rounding rounding,
+                         std::uint64_t seed) {
     cuda_quantize_nvfp4_impl(d_input, d_values, d_block_scales,
-                             rows, cols, global_scale);
+                             rows, cols, global_scale, rounding, seed);
 }
 
 void cuda_dequantize_nvfp4(const std::uint8_t* d_values,

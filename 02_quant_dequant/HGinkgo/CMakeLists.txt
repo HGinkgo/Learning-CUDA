@@ -43,12 +43,20 @@ set_target_properties(benchmark PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 add_executable(quant_cli quant_cli.cpp)
 target_link_libraries(quant_cli PRIVATE low_precision_io low_precision_reference)
 
+add_executable(cuda_quant_cli cuda_quant_cli.cu)
+target_link_libraries(cuda_quant_cli PRIVATE low_precision_cuda low_precision_io low_precision_reference)
+set_target_properties(cuda_quant_cli PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+
 enable_testing()
 add_test(NAME cpu_reference COMMAND test_cpu)
 add_test(NAME precision_types_cpu COMMAND test_precision_types)
 add_test(NAME io_round_trip COMMAND test_io)
 add_test(NAME cli_round_trip
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test_cli.sh $<TARGET_FILE:quant_cli>)
+add_test(NAME cuda_cli_round_trip
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test_cuda_cli.sh
+                 $<TARGET_FILE:cuda_quant_cli> $<TARGET_FILE:quant_cli>)
+set_tests_properties(cuda_cli_round_trip PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME cuda_reference COMMAND test_cuda)
 add_test(NAME benchmark_output
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/test_benchmark_output.sh $<TARGET_FILE:benchmark>)

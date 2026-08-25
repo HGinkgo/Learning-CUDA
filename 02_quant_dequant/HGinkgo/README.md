@@ -48,6 +48,17 @@ CSV 还包含 `input_type` 和 `output_type` 列；CUDA benchmark 会额外测�
 ./benchmark_cli.sh ./build/quant_cli 1024 2048
 ```
 
+真正走 CUDA kernel 的文件工作流使用 `cuda_quant_cli`：
+
+```bash
+./build/cuda_quant_cli quantize --input input.bin --output tensor.qnt \
+  --rows 1024 --cols 2048 --input-type fp16 --format nvfp4 --rounding nearest
+./build/cuda_quant_cli dequantize --input tensor.qnt --output output.bin \
+  --output-type bf16
+```
+
+该 CLI 将输入复制到 GPU，调用 CUDA 量化/反量化 API，再将 packed payload、scale 或输出张量写回文件。当前 CUDA 量化文件路径只接受 `nearest`；CPU reference CLI 仍提供 `stochastic` 作为对照实现。
+
 MXFP8 的 block scale 编码以及 NVFP4 的 block `amax`、global `amax`、block scale 编码和 packed payload 均在 CUDA 上完成；NVFP4 host 端只往返一个 global scale。
 
 FP16 输入以及 FP16/BF16 输出路径在 CUDA kernel 内直接完成格式转换，不再分配 FP32 临时输入或输出缓冲区；核心计算仍使用 FP32 中间值，保证与 CPU reference 的 payload 逐字节一致。NVFP4 的 global scale 选择也在设备端完成，公开同步 API 只在需要返回 `global_scale` 时复制一个标量到主机。

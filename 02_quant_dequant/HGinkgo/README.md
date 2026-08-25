@@ -50,4 +50,4 @@ CSV 还包含 `input_type` 和 `output_type` 列；CUDA benchmark 会额外测�
 
 MXFP8 的 block scale 编码以及 NVFP4 的 block `amax`、global `amax`、block scale 编码和 packed payload 均在 CUDA 上完成；NVFP4 host 端只往返一个 global scale。
 
-FP16/BF16 CUDA 接口当前在边界处执行格式转换，核心量化和解量化 kernel 继续使用 FP32 中间值，保证与 CPU reference 的 payload 逐字节一致。类型转换是否需要进一步融合，以后续 benchmark 和 profiler 数据为准。
+FP16 输入以及 FP16/BF16 输出路径在 CUDA kernel 内直接完成格式转换，不再分配 FP32 临时输入或输出缓冲区；核心计算仍使用 FP32 中间值，保证与 CPU reference 的 payload 逐字节一致。NVFP4 的 global scale 选择也在设备端完成，公开同步 API 只在需要返回 `global_scale` 时复制一个标量到主机。

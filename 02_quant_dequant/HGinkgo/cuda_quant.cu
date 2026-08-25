@@ -172,47 +172,28 @@ __device__ Bf16 bf16_from_float_device(float value) {
     return {static_cast<std::uint16_t>(bits >> 16u)};
 }
 
-__global__ void fp16_to_float_kernel(const Fp16* input, float* output,
-                                     std::size_t element_count) {
-    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index < element_count) {
-        output[index] = fp16_to_float_device(input[index]);
-    }
+__device__ float load_input_device(float value) {
+    return value;
 }
 
-__global__ void float_to_fp16_kernel(const float* input, Fp16* output,
-                                     std::size_t element_count) {
-    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index < element_count) {
-        output[index] = fp16_from_float_device(input[index]);
-    }
+__device__ float load_input_device(Fp16 value) {
+    return fp16_to_float_device(value);
 }
 
-__global__ void float_to_bf16_kernel(const float* input, Bf16* output,
-                                     std::size_t element_count) {
-    const std::size_t index = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (index < element_count) {
-        output[index] = bf16_from_float_device(input[index]);
-    }
+__device__ void store_output_device(float value, float* output) {
+    *output = value;
 }
 
-unsigned conversion_grid(std::size_t element_count) {
+__device__ void store_output_device(float value, Fp16* output) {
+    *output = fp16_from_float_device(value);
+}
+
+__device__ void store_output_device(float value, Bf16* output) {
+    *output = bf16_from_float_device(value);
+}
+
+unsigned element_grid(std::size_t element_count) {
     return static_cast<unsigned>((element_count + 255) / 256);
-}
-
-void convert_fp16_to_float(const Fp16* input, float* output, std::size_t element_count) {
-    fp16_to_float_kernel<<<conversion_grid(element_count), 256>>>(input, output, element_count);
-    check_kernel("FP16 input conversion");
-}
-
-void convert_float_to_fp16(const float* input, Fp16* output, std::size_t element_count) {
-    float_to_fp16_kernel<<<conversion_grid(element_count), 256>>>(input, output, element_count);
-    check_kernel("FP16 output conversion");
-}
-
-void convert_float_to_bf16(const float* input, Bf16* output, std::size_t element_count) {
-    float_to_bf16_kernel<<<conversion_grid(element_count), 256>>>(input, output, element_count);
-    check_kernel("BF16 output conversion");
 }
 
 __device__ void reduce_max_32(float* values) {
@@ -225,7 +206,8 @@ __device__ void reduce_max_32(float* values) {
     __syncthreads();
 }
 
-__global__ void block_amax_kernel(const float* input,
+template <typename Input>
+__global__ void block_amax_kernel(const Input* input,
                                   float* block_amax,
                                   std::size_t rows,
                                   std::size_t cols,
@@ -241,7 +223,7 @@ __global__ void block_amax_kernel(const float* input,
     const std::size_t col = begin + threadIdx.x;
     float local = 0.0f;
     if (col < cols && threadIdx.x < block_size) {
-        local = fabsf(input[row * cols + col]);
+        local = fabsf(load_input_device(input[row * cols + col]));
     }
     __shared__ float shared[32];
     shared[threadIdx.x] = local;
@@ -264,7 +246,8 @@ __global__ void encode_mxfp8_scales_kernel(const float* block_amax,
     scales[block_index] = encode_e8m0_device(requested_scale);
 }
 
-__global__ void nvfp4_block_amax_kernel(const float* input,
+template <typename Input>
+__global__ void nvfp4_block_amax_kernel(const Input* input,
                                         float* block_amax,
                                         float* global_amax,
                                         std::size_t rows,
@@ -281,7 +264,7 @@ __global__ void nvfp4_block_amax_kernel(const float* input,
         const std::size_t block = block_index % blocks_per_row;
         const std::size_t col = block * kNvBlock + lane;
         if (col < cols) {
-            local = fabsf(input[row * cols + col]);
+            local = fabsf(load_input_device(input[row * cols + col]));
         }
     }
     for (unsigned offset = 16; offset > 0; offset >>= 1u) {
@@ -290,6 +273,14 @@ __global__ void nvfp4_block_amax_kernel(const float* input,
     if (lane == 0 && block_index < block_count_total) {
         block_amax[block_index] = local;
         atomicMax(reinterpret_cast<unsigned int*>(global_amax), __float_as_uint(local));
+    }
+}
+
+__global__ void select_nvfp4_global_scale_kernel(const float* global_amax,
+                                                 float* global_scale) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        const float amax = *global_amax;
+        *global_scale = amax == 0.0f ? 1.0f : amax / (kMxFp8Max * kNvFp4Max);
     }
 }
 
@@ -310,7 +301,8 @@ __global__ void encode_nvfp4_scales_kernel(const float* block_amax,
     block_scales[block_index] = static_cast<std::uint8_t>(encode_e4m3_device(requested_scale));
 }
 
-__global__ void quantize_mxfp8_kernel(const float* input,
+template <typename Input>
+__global__ void quantize_mxfp8_kernel(const Input* input,
                                       std::uint8_t* values,
                                       const std::uint8_t* scales,
                                       std::size_t rows,
@@ -324,12 +316,14 @@ __global__ void quantize_mxfp8_kernel(const float* input,
     const std::size_t col = index % cols;
     const std::size_t block = col / kMxBlock;
     const float scale = decode_e8m0_device(scales[row * blocks_per_row + block]);
-    values[index] = static_cast<std::uint8_t>(encode_e4m3_device(input[index] / scale));
+    values[index] = static_cast<std::uint8_t>(
+        encode_e4m3_device(load_input_device(input[index]) / scale));
 }
 
+template <typename Output>
 __global__ void dequantize_mxfp8_kernel(const std::uint8_t* values,
                                         const std::uint8_t* scales,
-                                        float* output,
+                                        Output* output,
                                         std::size_t rows,
                                         std::size_t cols,
                                         std::size_t blocks_per_row) {
@@ -340,11 +334,13 @@ __global__ void dequantize_mxfp8_kernel(const std::uint8_t* values,
     const std::size_t row = index / cols;
     const std::size_t col = index % cols;
     const std::size_t block = col / kMxBlock;
-    output[index] = decode_e4m3_device(values[index]) *
-                    decode_e8m0_device(scales[row * blocks_per_row + block]);
+    store_output_device(
+        decode_e4m3_device(values[index]) * decode_e8m0_device(scales[row * blocks_per_row + block]),
+        &output[index]);
 }
 
-__global__ void quantize_nvfp4_kernel(const float* input,
+template <typename Input>
+__global__ void quantize_nvfp4_kernel(const Input* input,
                                       std::uint8_t* values,
                                       const std::uint8_t* block_scales,
                                       const float* global_scale,
@@ -364,22 +360,23 @@ __global__ void quantize_nvfp4_kernel(const float* input,
     const float selected_global_scale = *global_scale;
     const float first_scale = selected_global_scale *
                               decode_e4m3_device(block_scales[first_row * blocks_per_row + first_block]);
-    unsigned packed = encode_e2m1_device(input[first] / first_scale);
+    unsigned packed = encode_e2m1_device(load_input_device(input[first]) / first_scale);
     if (second < element_count) {
         const std::size_t second_row = second / cols;
         const std::size_t second_col = second % cols;
         const std::size_t second_block = second_col / kNvBlock;
         const float second_scale = selected_global_scale *
                                    decode_e4m3_device(block_scales[second_row * blocks_per_row + second_block]);
-        packed |= encode_e2m1_device(input[second] / second_scale) << 4u;
+        packed |= encode_e2m1_device(load_input_device(input[second]) / second_scale) << 4u;
     }
     values[pair] = static_cast<std::uint8_t>(packed);
 }
 
+template <typename Output>
 __global__ void dequantize_nvfp4_kernel(const std::uint8_t* values,
                                         const std::uint8_t* block_scales,
                                         float global_scale,
-                                        float* output,
+                                        Output* output,
                                         std::size_t rows,
                                         std::size_t cols,
                                         std::size_t blocks_per_row) {
@@ -391,8 +388,98 @@ __global__ void dequantize_nvfp4_kernel(const std::uint8_t* values,
     const std::size_t col = index % cols;
     const std::size_t block = col / kNvBlock;
     const unsigned code = (index & 1u) == 0 ? values[index / 2] & 0x0fu : values[index / 2] >> 4u;
-    output[index] = decode_e2m1_device(code) * global_scale *
-                    decode_e4m3_device(block_scales[row * blocks_per_row + block]);
+    store_output_device(
+        decode_e2m1_device(code) * global_scale *
+            decode_e4m3_device(block_scales[row * blocks_per_row + block]),
+        &output[index]);
+}
+
+template <typename Input>
+void cuda_quantize_mxfp8_impl(const Input* d_input,
+                              std::uint8_t* d_values,
+                              std::uint8_t* d_scales,
+                              std::size_t rows,
+                              std::size_t cols) {
+    check_shape(rows, cols);
+    const std::size_t blocks_per_row = block_count(cols, kMxBlock);
+    const std::size_t block_count_total = rows * blocks_per_row;
+    DeviceBuffer<float> d_amax(block_count_total);
+    block_amax_kernel<Input><<<static_cast<unsigned>(block_count_total), 32>>>(
+        d_input, d_amax.get(), rows, cols, kMxBlock, blocks_per_row);
+    check_kernel("MXFP8 block amax");
+    encode_mxfp8_scales_kernel<<<static_cast<unsigned>((block_count_total + 255) / 256), 256>>>(
+        d_amax.get(), d_scales, block_count_total);
+    check_kernel("MXFP8 scale encode");
+
+    const std::size_t element_count = rows * cols;
+    quantize_mxfp8_kernel<Input><<<element_grid(element_count), 256>>>(
+        d_input, d_values, d_scales, rows, cols, blocks_per_row);
+    check_kernel("MXFP8 quantize");
+}
+
+template <typename Output>
+void cuda_dequantize_mxfp8_impl(const std::uint8_t* d_values,
+                                const std::uint8_t* d_scales,
+                                Output* d_output,
+                                std::size_t rows,
+                                std::size_t cols) {
+    check_shape(rows, cols);
+    const std::size_t blocks_per_row = block_count(cols, kMxBlock);
+    const std::size_t element_count = rows * cols;
+    dequantize_mxfp8_kernel<Output><<<element_grid(element_count), 256>>>(
+        d_values, d_scales, d_output, rows, cols, blocks_per_row);
+    check_kernel("MXFP8 dequantize");
+}
+
+template <typename Input>
+void cuda_quantize_nvfp4_impl(const Input* d_input,
+                              std::uint8_t* d_values,
+                              std::uint8_t* d_block_scales,
+                              std::size_t rows,
+                              std::size_t cols,
+                              float* global_scale) {
+    check_shape(rows, cols);
+    const std::size_t blocks_per_row = block_count(cols, kNvBlock);
+    const std::size_t block_count_total = rows * blocks_per_row;
+    DeviceBuffer<float> d_amax(block_count_total);
+    DeviceBuffer<float> d_global_amax(1);
+    DeviceBuffer<float> d_global_scale(1);
+    check_cuda(cudaMemset(d_global_amax.get(), 0, sizeof(float)), "NVFP4 global amax reset");
+    const unsigned reduction_blocks = static_cast<unsigned>((block_count_total + 7) / 8);
+    nvfp4_block_amax_kernel<Input><<<reduction_blocks, 256>>>(
+        d_input, d_amax.get(), d_global_amax.get(), rows, cols, blocks_per_row);
+    check_kernel("NVFP4 block amax");
+    select_nvfp4_global_scale_kernel<<<1, 1>>>(d_global_amax.get(), d_global_scale.get());
+    check_kernel("NVFP4 global scale select");
+
+    encode_nvfp4_scales_kernel<<<static_cast<unsigned>((block_count_total + 255) / 256), 256>>>(
+        d_amax.get(), d_global_scale.get(), d_block_scales, block_count_total);
+    check_kernel("NVFP4 block scale encode");
+
+    const std::size_t packed_count = (rows * cols + 1) / 2;
+    quantize_nvfp4_kernel<Input><<<element_grid(packed_count), 256>>>(
+        d_input, d_values, d_block_scales, d_global_scale.get(), rows, cols, blocks_per_row);
+    check_kernel("NVFP4 quantize");
+    if (global_scale != nullptr) {
+        check_cuda(cudaMemcpy(global_scale, d_global_scale.get(), sizeof(float),
+                              cudaMemcpyDeviceToHost),
+                   "NVFP4 global scale copy");
+    }
+}
+
+template <typename Output>
+void cuda_dequantize_nvfp4_impl(const std::uint8_t* d_values,
+                                const std::uint8_t* d_block_scales,
+                                float global_scale,
+                                Output* d_output,
+                                std::size_t rows,
+                                std::size_t cols) {
+    check_shape(rows, cols);
+    const std::size_t blocks_per_row = block_count(cols, kNvBlock);
+    const std::size_t element_count = rows * cols;
+    dequantize_nvfp4_kernel<Output><<<element_grid(element_count), 256>>>(
+        d_values, d_block_scales, global_scale, d_output, rows, cols, blocks_per_row);
+    check_kernel("NVFP4 dequantize");
 }
 
 }  // namespace
@@ -402,22 +489,7 @@ void cuda_quantize_mxfp8(const float* d_input,
                          std::uint8_t* d_scales,
                          std::size_t rows,
                          std::size_t cols) {
-    check_shape(rows, cols);
-    const std::size_t blocks_per_row = block_count(cols, kMxBlock);
-    const std::size_t block_count_total = rows * blocks_per_row;
-    DeviceBuffer<float> d_amax(rows * blocks_per_row);
-    const dim3 reduction_grid(static_cast<unsigned>(rows * blocks_per_row));
-    block_amax_kernel<<<reduction_grid, 32>>>(d_input, d_amax.get(), rows, cols,
-                                              kMxBlock, blocks_per_row);
-    check_kernel("MXFP8 block amax");
-    encode_mxfp8_scales_kernel<<<static_cast<unsigned>((block_count_total + 255) / 256), 256>>>(
-        d_amax.get(), d_scales, block_count_total);
-    check_kernel("MXFP8 scale encode");
-
-    const std::size_t element_count = rows * cols;
-    quantize_mxfp8_kernel<<<static_cast<unsigned>((element_count + 255) / 256), 256>>>(
-        d_input, d_values, d_scales, rows, cols, blocks_per_row);
-    check_kernel("MXFP8 quantize");
+    cuda_quantize_mxfp8_impl(d_input, d_values, d_scales, rows, cols);
 }
 
 void cuda_quantize_mxfp8(const Fp16* d_input,
@@ -425,10 +497,7 @@ void cuda_quantize_mxfp8(const Fp16* d_input,
                          std::uint8_t* d_scales,
                          std::size_t rows,
                          std::size_t cols) {
-    check_shape(rows, cols);
-    DeviceBuffer<float> converted(rows * cols);
-    convert_fp16_to_float(d_input, converted.get(), rows * cols);
-    cuda_quantize_mxfp8(converted.get(), d_values, d_scales, rows, cols);
+    cuda_quantize_mxfp8_impl(d_input, d_values, d_scales, rows, cols);
 }
 
 void cuda_dequantize_mxfp8(const std::uint8_t* d_values,
@@ -436,12 +505,7 @@ void cuda_dequantize_mxfp8(const std::uint8_t* d_values,
                            float* d_output,
                            std::size_t rows,
                            std::size_t cols) {
-    check_shape(rows, cols);
-    const std::size_t blocks_per_row = block_count(cols, kMxBlock);
-    const std::size_t element_count = rows * cols;
-    dequantize_mxfp8_kernel<<<static_cast<unsigned>((element_count + 255) / 256), 256>>>(
-        d_values, d_scales, d_output, rows, cols, blocks_per_row);
-    check_kernel("MXFP8 dequantize");
+    cuda_dequantize_mxfp8_impl(d_values, d_scales, d_output, rows, cols);
 }
 
 void cuda_dequantize_mxfp8(const std::uint8_t* d_values,
@@ -449,10 +513,7 @@ void cuda_dequantize_mxfp8(const std::uint8_t* d_values,
                            Fp16* d_output,
                            std::size_t rows,
                            std::size_t cols) {
-    check_shape(rows, cols);
-    DeviceBuffer<float> converted(rows * cols);
-    cuda_dequantize_mxfp8(d_values, d_scales, converted.get(), rows, cols);
-    convert_float_to_fp16(converted.get(), d_output, rows * cols);
+    cuda_dequantize_mxfp8_impl(d_values, d_scales, d_output, rows, cols);
 }
 
 void cuda_dequantize_mxfp8(const std::uint8_t* d_values,
@@ -460,10 +521,7 @@ void cuda_dequantize_mxfp8(const std::uint8_t* d_values,
                            Bf16* d_output,
                            std::size_t rows,
                            std::size_t cols) {
-    check_shape(rows, cols);
-    DeviceBuffer<float> converted(rows * cols);
-    cuda_dequantize_mxfp8(d_values, d_scales, converted.get(), rows, cols);
-    convert_float_to_bf16(converted.get(), d_output, rows * cols);
+    cuda_dequantize_mxfp8_impl(d_values, d_scales, d_output, rows, cols);
 }
 
 void cuda_quantize_nvfp4(const float* d_input,
@@ -472,39 +530,8 @@ void cuda_quantize_nvfp4(const float* d_input,
                          std::size_t rows,
                          std::size_t cols,
                          float* global_scale) {
-    check_shape(rows, cols);
-    const std::size_t blocks_per_row = block_count(cols, kNvBlock);
-    const std::size_t block_count_total = rows * blocks_per_row;
-    DeviceBuffer<float> d_amax(block_count_total);
-    DeviceBuffer<float> d_global_amax(1);
-    DeviceBuffer<float> d_global_scale(1);
-    check_cuda(cudaMemset(d_global_amax.get(), 0, sizeof(float)), "NVFP4 global amax reset");
-    const unsigned reduction_blocks = static_cast<unsigned>((block_count_total + 7) / 8);
-    nvfp4_block_amax_kernel<<<reduction_blocks, 256>>>(
-        d_input, d_amax.get(), d_global_amax.get(), rows, cols, blocks_per_row);
-    check_kernel("NVFP4 block amax");
-    float global_amax = 0.0f;
-    check_cuda(cudaMemcpy(&global_amax, d_global_amax.get(), sizeof(float),
-                          cudaMemcpyDeviceToHost),
-               "NVFP4 global amax copy");
-    const float selected_global_scale = global_amax == 0.0f
-                                            ? 1.0f
-                                            : global_amax / (kMxFp8Max * kNvFp4Max);
-    check_cuda(cudaMemcpy(d_global_scale.get(), &selected_global_scale, sizeof(float),
-                          cudaMemcpyHostToDevice),
-               "NVFP4 global scale copy");
-    if (global_scale != nullptr) {
-        *global_scale = selected_global_scale;
-    }
-
-    encode_nvfp4_scales_kernel<<<static_cast<unsigned>((block_count_total + 255) / 256), 256>>>(
-        d_amax.get(), d_global_scale.get(), d_block_scales, block_count_total);
-    check_kernel("NVFP4 block scale encode");
-
-    const std::size_t packed_count = (rows * cols + 1) / 2;
-    quantize_nvfp4_kernel<<<static_cast<unsigned>((packed_count + 255) / 256), 256>>>(
-        d_input, d_values, d_block_scales, d_global_scale.get(), rows, cols, blocks_per_row);
-    check_kernel("NVFP4 quantize");
+    cuda_quantize_nvfp4_impl(d_input, d_values, d_block_scales,
+                             rows, cols, global_scale);
 }
 
 void cuda_quantize_nvfp4(const Fp16* d_input,
@@ -513,11 +540,8 @@ void cuda_quantize_nvfp4(const Fp16* d_input,
                          std::size_t rows,
                          std::size_t cols,
                          float* global_scale) {
-    check_shape(rows, cols);
-    DeviceBuffer<float> converted(rows * cols);
-    convert_fp16_to_float(d_input, converted.get(), rows * cols);
-    cuda_quantize_nvfp4(converted.get(), d_values, d_block_scales,
-                        rows, cols, global_scale);
+    cuda_quantize_nvfp4_impl(d_input, d_values, d_block_scales,
+                             rows, cols, global_scale);
 }
 
 void cuda_dequantize_nvfp4(const std::uint8_t* d_values,
@@ -526,12 +550,8 @@ void cuda_dequantize_nvfp4(const std::uint8_t* d_values,
                            float* d_output,
                            std::size_t rows,
                            std::size_t cols) {
-    check_shape(rows, cols);
-    const std::size_t blocks_per_row = block_count(cols, kNvBlock);
-    const std::size_t element_count = rows * cols;
-    dequantize_nvfp4_kernel<<<static_cast<unsigned>((element_count + 255) / 256), 256>>>(
-        d_values, d_block_scales, global_scale, d_output, rows, cols, blocks_per_row);
-    check_kernel("NVFP4 dequantize");
+    cuda_dequantize_nvfp4_impl(d_values, d_block_scales, global_scale,
+                               d_output, rows, cols);
 }
 
 void cuda_dequantize_nvfp4(const std::uint8_t* d_values,
@@ -540,11 +560,8 @@ void cuda_dequantize_nvfp4(const std::uint8_t* d_values,
                            Fp16* d_output,
                            std::size_t rows,
                            std::size_t cols) {
-    check_shape(rows, cols);
-    DeviceBuffer<float> converted(rows * cols);
-    cuda_dequantize_nvfp4(d_values, d_block_scales, global_scale,
-                          converted.get(), rows, cols);
-    convert_float_to_fp16(converted.get(), d_output, rows * cols);
+    cuda_dequantize_nvfp4_impl(d_values, d_block_scales, global_scale,
+                               d_output, rows, cols);
 }
 
 void cuda_dequantize_nvfp4(const std::uint8_t* d_values,
@@ -553,11 +570,8 @@ void cuda_dequantize_nvfp4(const std::uint8_t* d_values,
                            Bf16* d_output,
                            std::size_t rows,
                            std::size_t cols) {
-    check_shape(rows, cols);
-    DeviceBuffer<float> converted(rows * cols);
-    cuda_dequantize_nvfp4(d_values, d_block_scales, global_scale,
-                          converted.get(), rows, cols);
-    convert_float_to_bf16(converted.get(), d_output, rows * cols);
+    cuda_dequantize_nvfp4_impl(d_values, d_block_scales, global_scale,
+                               d_output, rows, cols);
 }
 
 }  // namespace low_precision

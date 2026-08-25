@@ -18,6 +18,8 @@ void test_round_trip() {
     expected.rounding = low_precision::Rounding::Stochastic;
     expected.rows = 3;
     expected.cols = 17;
+    expected.block_size = 16;
+    expected.scale_mode = low_precision::ScaleMode::TensorAndBlock;
     expected.global_scale = 0.125f;
     expected.values.resize(26);
     for (std::size_t index = 0; index < expected.values.size(); ++index) {
@@ -32,6 +34,8 @@ void test_round_trip() {
     assert(actual.rounding == expected.rounding);
     assert(actual.rows == expected.rows);
     assert(actual.cols == expected.cols);
+    assert(actual.block_size == expected.block_size);
+    assert(actual.scale_mode == expected.scale_mode);
     assert(actual.global_scale == expected.global_scale);
     assert(actual.values == expected.values);
     assert(actual.scales == expected.scales);
@@ -53,6 +57,8 @@ void test_rejects_invalid_magic_and_truncation() {
     low_precision::QuantizedFile valid;
     valid.rows = 1;
     valid.cols = 1;
+    valid.block_size = 32;
+    valid.scale_mode = low_precision::ScaleMode::Block;
     valid.values = {0};
     valid.scales = {127};
     low_precision::write_quantized_file(kCorruptPath, valid);

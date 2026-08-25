@@ -197,6 +197,10 @@ low_precision::QuantizedFile quantize(const Options& options) {
     file.rounding = options.rounding;
     file.rows = options.rows;
     file.cols = options.cols;
+    file.block_size = options.format == low_precision::Format::MxFp8 ? 32u : 16u;
+    file.scale_mode = options.format == low_precision::Format::MxFp8
+                          ? low_precision::ScaleMode::Block
+                          : low_precision::ScaleMode::TensorAndBlock;
     if (options.input_type == low_precision::InputType::Fp32) {
         const auto input = decode_raw<float>(bytes, count);
         if (options.format == low_precision::Format::MxFp8) {

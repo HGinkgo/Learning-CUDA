@@ -10,7 +10,7 @@ namespace low_precision {
 namespace {
 
 constexpr std::array<char, 8> kMagic{'L', 'P', 'C', 'Q', 'N', 'T', '1', '\0'};
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kVersion = 2;
 constexpr std::size_t kMxBlock = 32;
 constexpr std::size_t kNvBlock = 16;
 
@@ -55,6 +55,15 @@ void validate(const QuantizedFile& file) {
         throw std::runtime_error("unsupported rounding mode");
     }
 
+    const std::uint32_t expected_block_size =
+        file.format == Format::MxFp8 ? static_cast<std::uint32_t>(kMxBlock)
+                                     : static_cast<std::uint32_t>(kNvBlock);
+    const ScaleMode expected_scale_mode =
+        file.format == Format::MxFp8 ? ScaleMode::Block : ScaleMode::TensorAndBlock;
+    if (file.block_size != expected_block_size || file.scale_mode != expected_scale_mode) {
+        throw std::runtime_error("scale metadata does not match quantization format");
+    }
+
     std::size_t expected_values = elements;
     std::size_t expected_scales = file.rows * block_count(file.cols, kMxBlock);
     if (file.format == Format::NvFp4) {
@@ -88,7 +97,9 @@ void write_quantized_file(const std::string& path, const QuantizedFile& file) {
     write_scalar(output, static_cast<std::uint64_t>(file.values.size()));
     write_scalar(output, static_cast<std::uint64_t>(file.scales.size()));
     write_scalar(output, file.global_scale);
-    write_scalar(output, static_cast<std::uint64_t>(0));
+    const std::uint64_t scale_metadata = static_cast<std::uint64_t>(file.block_size) |
+                                         (static_cast<std::uint64_t>(file.scale_mode) << 32u);
+    write_scalar(output, scale_metadata);
     output.write(reinterpret_cast<const char*>(file.values.data()),
                  static_cast<std::streamsize>(file.values.size()));
     output.write(reinterpret_cast<const char*>(file.scales.data()),
@@ -110,7 +121,7 @@ QuantizedFile read_quantized_file(const std::string& path) {
         throw std::runtime_error("invalid quantized file magic");
     }
     const std::uint32_t version = read_scalar<std::uint32_t>(input, "version");
-    if (version != kVersion) {
+    if (version != 1 && version != kVersion) {
         throw std::runtime_error("unsupported quantized file version");
     }
 
@@ -123,7 +134,7 @@ QuantizedFile read_quantized_file(const std::string& path) {
     const std::uint64_t values_size = read_scalar<std::uint64_t>(input, "values size");
     const std::uint64_t scales_size = read_scalar<std::uint64_t>(input, "scales size");
     file.global_scale = read_scalar<float>(input, "global scale");
-    static_cast<void>(read_scalar<std::uint64_t>(input, "reserved"));
+    const std::uint64_t scale_metadata = read_scalar<std::uint64_t>(input, "scale metadata");
 
     if (rows > std::numeric_limits<std::size_t>::max() ||
         cols > std::numeric_limits<std::size_t>::max() ||
@@ -136,6 +147,15 @@ QuantizedFile read_quantized_file(const std::string& path) {
     file.rounding = static_cast<Rounding>(rounding);
     file.rows = static_cast<std::size_t>(rows);
     file.cols = static_cast<std::size_t>(cols);
+    if (version == 1) {
+        file.block_size = file.format == Format::MxFp8 ? static_cast<std::uint32_t>(kMxBlock)
+                                                       : static_cast<std::uint32_t>(kNvBlock);
+        file.scale_mode = file.format == Format::MxFp8 ? ScaleMode::Block
+                                                        : ScaleMode::TensorAndBlock;
+    } else {
+        file.block_size = static_cast<std::uint32_t>(scale_metadata & 0xffffffffu);
+        file.scale_mode = static_cast<ScaleMode>(scale_metadata >> 32u);
+    }
     file.values.resize(static_cast<std::size_t>(values_size));
     file.scales.resize(static_cast<std::size_t>(scales_size));
     input.read(reinterpret_cast<char*>(file.values.data()),

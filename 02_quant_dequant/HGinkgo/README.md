@@ -26,7 +26,7 @@ CLI 使用 little-endian 原始输入和量化文件：
   --output-type bf16
 ```
 
-`.qnt` 文件头保存 magic、版本、矩阵尺寸、输入类型、量化格式、rounding、payload 大小和 NVFP4 global scale；读取时会校验 payload 尺寸并拒绝截断或尾随数据。
+`.qnt` 文件头保存 magic、版本、矩阵尺寸、输入类型、量化格式、rounding、payload 大小、block size、scale mode 和 NVFP4 global scale；当前写入版本为 v2，同时兼容读取 v1 文件。读取时会校验 scale metadata、payload 尺寸并拒绝截断或尾随数据。
 
 运行 GPU 正确性和性能测试（默认 `1024 x 2048`，每个 case 重复 5 次）：
 

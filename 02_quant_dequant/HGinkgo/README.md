@@ -10,6 +10,26 @@
 
 目录按共享代码和后端实现分层：`include/low_precision` 保存公共接口，`common` 保存 CPU reference 与文件格式，`backends/nvidia` 保存 NVIDIA CUDA kernel，`apps` 保存 CLI/benchmark，`tests` 保存验证脚本。后续国产平台在 `backends/iluvatar`、`backends/metax` 或 `backends/moore_threads` 中实现同一后端接口，不复制公共代码。
 
+天数智芯（Iluvatar）使用 CoreX Clang 的 CUDA 兼容模式构建同一 kernel。设备端 FP16 输入按 storage bits 软件解码，避免不同后端的半精度转换指令造成 payload 差异。天数环境示例：
+
+```bash
+export COREX_VERSION=4.4.0
+source /usr/local/corex-${COREX_VERSION}/enable
+export LD_LIBRARY_PATH=/usr/local/corex-${COREX_VERSION}/lib64:${LD_LIBRARY_PATH:-}
+ixsmi
+cmake -S . -B build-iluvatar -G "Unix Makefiles" \
+  -DLP_BACKEND=iluvatar \
+  -DCMAKE_CXX_COMPILER=/usr/local/corex-${COREX_VERSION}/bin/clang++ \
+  -DCMAKE_CUDA_COMPILER=/usr/local/corex-${COREX_VERSION}/bin/clang++
+cmake --build build-iluvatar
+ctest --test-dir build-iluvatar --output-on-failure
+```
+
+The `LD_LIBRARY_PATH` export is required when running the generated binaries
+outside the CoreX environment. The Iluvatar path compiles the shared `.cu`
+kernel source with CoreX Clang's `ivcore` target; it does not duplicate the
+CPU reference or file format implementation.
+
 构建和测试：
 
 ```bash

@@ -121,11 +121,26 @@ __device__ unsigned encode_e2m1_device(float value,
 __device__ float decode_e4m3_magnitude_device(unsigned code) {
     const unsigned exponent = (code >> 3u) & 0x0fu;
     const unsigned mantissa = code & 0x07u;
-    if (exponent == 0) {
-        return ldexpf(static_cast<float>(mantissa), -9);
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
+            return 0.0f;
+        }
+        unsigned highest_bit = 2u;
+        while ((mantissa & (1u << highest_bit)) == 0u) {
+            --highest_bit;
+        }
+        const unsigned float_exponent = highest_bit + 118u;
+        const unsigned float_mantissa =
+            (mantissa - (1u << highest_bit)) << (23u - highest_bit);
+        return __int_as_float(static_cast<int>((float_exponent << 23u) |
+                                                float_mantissa));
     }
-    return ldexpf(1.0f + static_cast<float>(mantissa) / 8.0f,
-                  static_cast<int>(exponent) - 7);
+    if (exponent == 15u && mantissa == 7u) {
+        return __int_as_float(0x7fc00000);
+    }
+    const unsigned float_exponent = exponent + 120u;
+    return __int_as_float(static_cast<int>((float_exponent << 23u) |
+                                            (mantissa << 20u)));
 }
 
 __device__ float decode_e4m3_device(unsigned code) {
@@ -168,7 +183,10 @@ __device__ unsigned encode_e4m3_device(float value,
 }
 
 __device__ float decode_e8m0_device(unsigned code) {
-    return ldexpf(1.0f, static_cast<int>(code) - 127);
+    if (code == 0u) {
+        return __int_as_float(0x00400000);
+    }
+    return __int_as_float(static_cast<int>(code << 23u));
 }
 
 __device__ std::uint8_t encode_e8m0_device(float scale) {
@@ -185,7 +203,34 @@ __device__ std::uint8_t encode_e8m0_device(float scale) {
 }
 
 __device__ float fp16_to_float_device(Fp16 value) {
-    return __half2float(__ushort_as_half(value.bits));
+    const unsigned sign = value.bits >> 15u;
+    const unsigned exponent = (value.bits >> 10u) & 0x1fu;
+    const unsigned mantissa = value.bits & 0x03ffu;
+    const unsigned sign_bits = sign << 31u;
+    if (exponent == 0u) {
+        if (mantissa == 0u) {
+            return __int_as_float(static_cast<int>(sign_bits));
+        }
+        unsigned highest_bit = 9u;
+        while ((mantissa & (1u << highest_bit)) == 0u) {
+            --highest_bit;
+        }
+        const unsigned float_exponent = highest_bit + 103u;
+        const unsigned float_mantissa =
+            (mantissa - (1u << highest_bit)) << (23u - highest_bit);
+        return __int_as_float(static_cast<int>(sign_bits |
+                                                (float_exponent << 23u) |
+                                                float_mantissa));
+    }
+    if (exponent == 31u) {
+        return __int_as_float(static_cast<int>(sign_bits |
+                                                (0xffu << 23u) |
+                                                (mantissa == 0u ? 0u : 0x400000u)));
+    }
+    const unsigned float_exponent = exponent + 112u;
+    return __int_as_float(static_cast<int>(sign_bits |
+                                            (float_exponent << 23u) |
+                                            (mantissa << 13u)));
 }
 
 __device__ Fp16 fp16_from_float_device(float value) {

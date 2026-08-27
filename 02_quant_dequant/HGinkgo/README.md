@@ -8,7 +8,7 @@
 - `NearestEven` 和 `Stochastic` 均提供接口；默认测试使用 `NearestEven`。
 - `Fp16` 和 `Bf16` 使用明确的 16-bit storage wrapper；FP16 输入可直接量化，MXFP8/NVFP4 解量化可输出 FP32、FP16 或 BF16。
 
-目录按共享代码和后端实现分层：`include/low_precision` 保存公共接口，`common` 保存 CPU reference 与文件格式，`backends/nvidia` 保存 NVIDIA CUDA kernel，`apps` 保存 CLI/benchmark，`tests` 保存验证脚本。后续国产平台在 `backends/iluvatar`、`backends/metax` 或 `backends/moore_threads` 中实现同一后端接口，不复制公共代码。
+目录按共享代码和后端实现分层：`include/low_precision` 保存公共接口，`common` 保存 CPU reference 与文件格式，`backends/nvidia` 保存 NVIDIA CUDA kernel，`apps` 保存 CLI/benchmark，`tests` 保存验证脚本。天数智芯和壁仞后端分别位于 `backends/iluvatar`、`backends/biren`，均复用公共代码和同一份量化 kernel 源码。
 
 天数智芯（Iluvatar）使用 CoreX Clang 的 CUDA 兼容模式构建同一 kernel。设备端 FP16 输入按 storage bits 软件解码，避免不同后端的半精度转换指令造成 payload 差异。天数环境示例：
 
@@ -29,6 +29,18 @@ The `LD_LIBRARY_PATH` export is required when running the generated binaries
 outside the CoreX environment. The Iluvatar path compiles the shared `.cu`
 kernel source with CoreX Clang's `ivcore` target; it does not duplicate the
 CPU reference or file format implementation.
+
+壁仞使用 BIRENSUPA 编译相同的 CUDA 风格 kernel；该路径使用 `.su` adapter
+和轻量 runtime 映射，不复制量化实现。已在 Biren166M（SUPA 1.11，`br100`）
+完成 8 项 CTest：
+
+```bash
+source /usr/local/birensupa/br_container_tools/brsw_set_env.sh
+cmake -S . -B build-biren -G Ninja \
+  -DLP_BACKEND=biren -DLP_BIREN_ARCH=br100
+cmake --build build-biren
+ctest --test-dir build-biren --output-on-failure
+```
 
 构建和测试：
 

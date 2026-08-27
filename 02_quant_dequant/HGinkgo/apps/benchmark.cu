@@ -21,6 +21,10 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
+#ifndef LP_GPU_BACKEND_NAME
+#define LP_GPU_BACKEND_NAME "cuda"
+#endif
+
 enum class Distribution { Random, Normal, Outlier };
 
 struct Metrics {
@@ -370,7 +374,7 @@ void benchmark_mxfp8(const std::vector<float>& input,
     gpu_timings.device_quant = summarize(std::move(device_quant_samples));
     gpu_timings.api_dequant = summarize(std::move(api_dequant_samples));
     gpu_timings.device_dequant = summarize(std::move(device_dequant_samples));
-    print_row(distribution, "mxfp8", "cuda", "fp32", "fp32", rows, cols,
+    print_row(distribution, "mxfp8", LP_GPU_BACKEND_NAME, "fp32", "fp32", rows, cols,
               gpu_timings, gpu_metrics,
               static_cast<double>(input_bytes) / payload_bytes,
               input_bytes, input_bytes, payload_bytes,
@@ -465,7 +469,7 @@ void benchmark_nvfp4(const std::vector<float>& input,
     gpu_timings.device_quant = summarize(std::move(device_quant_samples));
     gpu_timings.api_dequant = summarize(std::move(api_dequant_samples));
     gpu_timings.device_dequant = summarize(std::move(device_dequant_samples));
-    print_row(distribution, "nvfp4", "cuda", "fp32", "fp32", rows, cols,
+    print_row(distribution, "nvfp4", LP_GPU_BACKEND_NAME, "fp32", "fp32", rows, cols,
               gpu_timings, gpu_metrics,
               static_cast<double>(input_bytes) / payload_bytes,
               input_bytes, input_bytes, payload_bytes,
@@ -540,7 +544,7 @@ void benchmark_mxfp8_typed(const std::vector<float>& input,
     timings.api_dequant = summarize(std::move(api_dequant_samples));
     timings.device_dequant = summarize(std::move(device_dequant_samples));
     const Metrics metrics = compare_typed(input, gpu_output, decode);
-    print_row(distribution, "mxfp8", "cuda", "fp16", output_type, rows, cols,
+    print_row(distribution, "mxfp8", LP_GPU_BACKEND_NAME, "fp16", output_type, rows, cols,
               timings, metrics,
               static_cast<double>(input_bytes) / payload_bytes,
               input_bytes, output_bytes, payload_bytes,
@@ -621,7 +625,7 @@ void benchmark_nvfp4_typed(const std::vector<float>& input,
     timings.api_dequant = summarize(std::move(api_dequant_samples));
     timings.device_dequant = summarize(std::move(device_dequant_samples));
     const Metrics metrics = compare_typed(input, gpu_output, decode);
-    print_row(distribution, "nvfp4", "cuda", "fp16", output_type, rows, cols,
+    print_row(distribution, "nvfp4", LP_GPU_BACKEND_NAME, "fp16", output_type, rows, cols,
               timings, metrics,
               static_cast<double>(input_bytes) / payload_bytes,
               input_bytes, output_bytes, payload_bytes,
